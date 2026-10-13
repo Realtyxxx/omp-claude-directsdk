@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - A native tool call whose name exactly matches an advertised wire name without the `mcp__pi__` prefix (for example `read`) is now accepted as that tool. Matching is exact and case-sensitive; other unprefixed names (for example `Bash`, `Read`) still fail with the `native` error.
+- Tool names stored in the replay carrier are normalized to the prefixed `mcp__pi__<wire>` form, so an accepted unprefixed call is never replayed unprefixed.
 
 ### Notes
 

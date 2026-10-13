@@ -762,6 +762,7 @@ async function executeCall(
     }
 
     const toolCalls: ToolCall[] = [];
+    const acceptedWires: string[] = [];
     for (const block of calls) {
       const raw = block as unknown as Record<string, unknown>;
       const name = typeof raw["name"] === "string" ? raw["name"] : "";
@@ -775,6 +776,7 @@ async function executeCall(
           `(advertised: ${describeInventory(build.wireToName.keys())})`,
         );
       }
+      acceptedWires.push(wire as string);
       const parsed = parseToolInput(raw["input"]);
       const toolCall: ToolCall = {
         type: "toolCall",
@@ -811,6 +813,21 @@ async function executeCall(
 
     const projection = messageProjection(output);
     const natives = used && relay.capture.message ? [relay.capture.message] : assistants;
+    // An accepted unprefixed name must not be persisted: replay forwards carrier
+    // tool_use blocks verbatim, which would teach the model the bare form. Walk
+    // `natives` itself (the stdout path merges into a separate object). Match by
+    // id; fall back to order, which mergeAssistants preserves, when ids are absent.
+    const nativeUses = natives.flatMap((m) => m.content.filter((b) => b.type === "tool_use"));
+    calls.forEach((call, k) => {
+      const id = (call as unknown as Record<string, unknown>)["id"];
+      const target =
+        typeof id === "string" && id
+          ? nativeUses.find((b) => (b as unknown as Record<string, unknown>)["id"] === id)
+          : nativeUses[k];
+      if (target) {
+        (target as unknown as Record<string, unknown>)["name"] = toolPrefixedName(acceptedWires[k]!);
+      }
+    });
     // OMP's ProviderPayload union is closed; the carrier is plain JSON data
     // that OMP persists and passes back unchanged on replay.
     output.providerPayload = encodeCarrier(natives, projection, {
