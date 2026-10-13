@@ -1,5 +1,5 @@
 /** Public Anthropic metadata. A changed or incomplete source fails closed. */
-import type { Api, Model } from "@earendil-works/pi-ai/compat";
+import type { Effort } from "@oh-my-pi/pi-ai";
 import type { DiscoveredModel } from "./discovery.js";
 import { PROVIDER_ID } from "./models.js";
 
@@ -9,8 +9,34 @@ const PRICING = `${ROOT}/about-claude/pricing.md`;
 const EFFORT = `${ROOT}/build-with-claude/effort.md`;
 const LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type ChatModel = Model<Api>;
+interface Rates { input: number; output: number; cacheRead: number; cacheWrite: number }
+type ThinkingLevelMap = Record<"off" | Effort, string | null>;
+
+/**
+ * One catalog row in OMP's `registerProvider` model shape. OMP's model config
+ * carries a flat price, so long-context pricing tiers are validated but only
+ * the base rates are kept; OMP reports the cost as an estimate either way.
+ */
+export interface ChatModel {
+  id: string;
+  name: string;
+  api: string;
+  reasoning: boolean;
+  thinking?: { mode: "effort"; efforts: Effort[] };
+  input: ("text" | "image")[];
+  contextWindow: number;
+  maxTokens: number;
+  cost: Rates;
+}
 export interface CatalogResult { models: ChatModel[]; warnings: string[] }
+
+const OMP_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/** OMP efforts whose native mapping exists; undefined when none are controllable. */
+function thinkingConfig(map: ThinkingLevelMap): ChatModel["thinking"] {
+  const efforts = OMP_EFFORTS.filter(level => map[level] !== null) as Effort[];
+  return efforts.length ? { mode: "effort", efforts } : undefined;
+}
 
 function plain(value: string): string {
   return value.replace(/<sup>.*?<\/sup>/g, "").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
@@ -71,12 +97,12 @@ function price(value: string | undefined): number {
   return Number(match[1]);
 }
 
-function pricingFor(name: string, pricing: string[][]): ChatModel["cost"] {
+function pricingFor(name: string, pricing: string[][]): Rates {
   const rows = pricing.slice(1).filter(row => row[0]?.split(" (")[0] === name);
   if (!rows.length) throw new Error("missing pricing");
-  let base: ChatModel["cost"] | undefined;
+  let base: Rates | undefined;
   let ceiling: number | undefined;
-  const tiers: NonNullable<ChatModel["cost"]["tiers"]> = [];
+  const tiers: Array<Rates & { inputTokensAbove: number }> = [];
   for (const row of rows) {
     const rates = { input: price(row[1]), cacheWrite: price(row[2]), cacheRead: price(row[4]), output: price(row[5]) };
     if (price(row[3]) !== rates.input * 2) throw new Error("1-hour cache pricing cannot be represented by Pi");
@@ -98,22 +124,11 @@ function pricingFor(name: string, pricing: string[][]): ChatModel["cost"] {
     throw new Error("incomplete pricing tiers");
   }
   if (tiers.length && ceiling === undefined) throw new Error("missing pricing tier boundary");
-  return { ...base, ...(tiers.length ? { tiers } : {}) };
-}
-
-function cacheLifetimes(prices: string): NonNullable<ChatModel["promptCache"]> {
-  const table = tables(prices).find(rows => rows[0]?.[0] === "Cache operation");
-  const seconds = (operation: string): number => {
-    const duration = table?.find(row => row[0] === operation)?.[2];
-    const match = /^Cache valid for (\d+) (minutes?|hours?)$/.exec(duration ?? "");
-    if (!match) throw new Error("missing prompt cache lifetime");
-    return Number(match[1]) * (match[2]?.startsWith("hour") ? 3600 : 60);
-  };
-  return { short: seconds("5-minute cache write"), long: seconds("1-hour cache write") };
+  return base;
 }
 
 function thinkingMap(name: string, thinking: string, defaultEffort: string | undefined,
-  live: DiscoveredModel | undefined, effort: string[][]): NonNullable<ChatModel["thinkingLevelMap"]> {
+  live: DiscoveredModel | undefined, effort: string[][]): ThinkingLevelMap {
   let supported: string[];
   if (live?.supportsEffort === true && live.supportedEffortLevels?.length) {
     supported = live.supportedEffortLevels;
@@ -148,7 +163,6 @@ export async function loadWebCatalog(picker: DiscoveredModel[], signal: AbortSig
   const [overview, prices, efforts] = await Promise.all([
     document(OVERVIEW, signal), document(PRICING, signal), document(EFFORT, signal),
   ]);
-  const promptCache = cacheLifetimes(prices);
   const overviewTables = tables(overview);
   const current = overviewTables.find(table => table[0]?.[0] === "Feature")?.find(row => row[0] === "Claude API ID")?.slice(1);
   if (!current?.length) throw new Error(`Missing current model IDs in ${OVERVIEW}`);
@@ -182,16 +196,17 @@ export async function loadWebCatalog(picker: DiscoveredModel[], signal: AbortSig
         const inputs = value("Input → output");
         if (inputs !== "Text and images → text" && inputs !== "Text → text") throw new Error("missing input modalities");
         const live = picker.find(row => row.id === id);
+        const levels = thinkingMap(link.name, thinking, value("Default effort"), live, effort);
+        const thinkingConf = thinkingConfig(levels);
         const model: ChatModel = {
           id, name: `${link.name} (subscription${live ? "" : "; not in CLI picker"})`,
-          api: PROVIDER_ID, provider: PROVIDER_ID, baseUrl: "process://claude-directsdk",
+          api: PROVIDER_ID,
           reasoning: thinking !== "Not supported",
-          thinkingLevelMap: thinkingMap(link.name, thinking, value("Default effort"), live, effort),
+          ...(thinkingConf ? { thinking: thinkingConf } : {}),
           input: inputs === "Text → text" ? ["text"] : ["text", "image"],
           contextWindow: tokenLimit(value("Context window"), "context window"),
           maxTokens: tokenLimit(value("Max output"), "output limit"),
           cost: pricingFor(link.name, pricing),
-          promptCache,
         };
         models.push(model);
         for (const alias of picker.filter(row => row.id === id && row.alias !== id)) {

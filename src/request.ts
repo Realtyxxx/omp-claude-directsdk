@@ -8,8 +8,9 @@
  * identity headers are never replaced; the relay preserves them.
  */
 
+import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
-import type { ThinkingLevel, Tool } from "@earendil-works/pi-ai/compat";
+import type { Effort, Tool, ToolChoice } from "@oh-my-pi/pi-ai";
 import { isRecord } from "./types.js";
 import { INERT_MCP_SOURCE } from "./inert-mcp.js";
 
@@ -41,28 +42,67 @@ function isTruthy(value: string | undefined): boolean {
 }
 
 /**
- * Names of conflicting native auth/backend overrides present in the merged
- * environment. Subscription mode rejects them; explicit test mode
- * (`PI_DIRECTSDK_TEST_UPSTREAM=1`) allows them for loopback and gateway
- * fixtures. Values are never returned.
+ * Markers a parent Claude Code session exports to its children. A child
+ * `claude` that inherits them believes it is nested inside that session.
  */
-export function checkEnvConflicts(env: NodeJS.ProcessEnv): string[] {
-  if (isTruthy(env[TEST_UPSTREAM_ENV])) {
-    return [];
+const NESTED_SESSION_VARS = [
+  "CLAUDECODE",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_CODE_CHILD_SESSION",
+  "CLAUDE_CODE_SESSION_ATTENDED",
+  "CLAUDE_CODE_MESSAGING_SOCKET",
+  "CLAUDE_CODE_MESSAGING_TOKEN",
+  "CLAUDE_CODE_EXECPATH",
+  "CLAUDE_CODE_PLUGIN_DIRS",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "CLAUDE_EFFORT",
+  "CLAUDE_PID",
+] as const;
+
+export function isTestUpstream(env: NodeJS.ProcessEnv): boolean {
+  return isTruthy(env[TEST_UPSTREAM_ENV]);
+}
+
+/**
+ * Remove native auth/backend overrides from the child environment.
+ *
+ * OMP users routinely export `ANTHROPIC_API_KEY` or `ANTHROPIC_BASE_URL` for
+ * OMP's own Anthropic provider. Upstream refuses the request when it sees
+ * them; this port strips them from the child instead, so the child can only
+ * authenticate through its own subscription login and never bills an API key.
+ * Explicit test mode (`PI_DIRECTSDK_TEST_UPSTREAM=1`) keeps them for loopback
+ * and gateway fixtures. Values are never read.
+ */
+export function stripConflictingEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
+  for (const name of NESTED_SESSION_VARS) {
+    delete out[name];
   }
-  const conflicts: string[] = CONFLICTING_API_VARS.filter(
-    (name) => (env[name] ?? "") !== "",
-  );
-  for (const name of CONFLICTING_BACKEND_VARS) {
-    if (isTruthy(env[name])) {
-      conflicts.push(name);
-    }
+  if (isTestUpstream(env)) {
+    return out;
   }
-  return conflicts;
+  for (const name of [...CONFLICTING_API_VARS, ...CONFLICTING_BACKEND_VARS]) {
+    delete out[name];
+  }
+  return out;
 }
 
 export function toolPrefixedName(bare: string): string {
   return `${TOOL_NAME_PREFIX}${bare}`;
+}
+
+const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,50}$/;
+
+/**
+ * Native-safe name for an OMP tool. OMP MCP tools can exceed the 50-character
+ * budget left after the `mcp__pi__` prefix or contain other characters; those
+ * get a stable hash alias so history replay maps them identically every call.
+ */
+export function toolWireName(name: string): string {
+  return TOOL_NAME_PATTERN.test(name)
+    ? name
+    : `pi_${createHash("sha256").update(name).digest("hex").slice(0, 24)}`;
 }
 
 /** Bare Pi tool name for a native tool name, or null when foreign. */
@@ -119,9 +159,12 @@ export interface RequestBuild {
   manifest: ManifestEntry[];
   /** Bare Pi tool names in order. */
   toolNames: string[];
+  /** Native wire name (without the MCP prefix) to OMP tool name. */
+  wireToName: Map<string, string>;
 }
 
-const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,50}$/;
+/** Native effort levels Claude Code accepts in `output_config.effort`. */
+export const NATIVE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 /**
  * Build the native request body and the inert MCP manifest from Pi tools.
@@ -129,41 +172,56 @@ const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,50}$/;
  */
 export function buildRequestBody(options: {
   tools: Tool[];
-  toolChoice?: "auto" | "none" | undefined;
-  reasoning?: ThinkingLevel | undefined;
-  thinkingLevelMap?: Partial<Record<string, string | null>> | undefined;
+  toolChoice?: ToolChoice | undefined;
+  reasoning?: Effort | undefined;
+  disableReasoning?: boolean | undefined;
+  /** Native effort levels the selected model supports; empty or absent sends none. */
+  efforts?: readonly string[] | undefined;
   maxTokens?: number | undefined;
 }): RequestBuild {
   const { tools } = options;
   if (options.toolChoice !== undefined && options.toolChoice !== "auto" && options.toolChoice !== "none") {
-    throw new Error("Only tool_choice auto and none are supported");
+    throw new Error(
+      `Only tool_choice auto and none are supported by the Claude CLI transport (got ${JSON.stringify(options.toolChoice)})`,
+    );
   }
   const useTools = options.toolChoice !== "none";
   const manifest: ManifestEntry[] = [];
   const bodyTools: Array<Record<string, unknown>> = [];
   const toolNames: string[] = [];
+  const wireToName = new Map<string, string>();
   const seen = new Set<string>();
 
   if (useTools) {
     for (const tool of tools) {
       const name = tool.name;
-      if (typeof name !== "string" || !TOOL_NAME_PATTERN.test(name)) {
-        throw new Error(`Tool names must be unique ASCII identifiers of at most 50 characters: ${name}`);
+      // Provider-hosted tools (computer use) have no JSON-schema form here.
+      if (tool.native) {
+        continue;
+      }
+      if (typeof name !== "string" || !name) {
+        throw new Error(`Tool names must be nonempty strings: ${String(name)}`);
       }
       if (seen.has(name)) {
         throw new Error(`Duplicate tool name: ${name}`);
       }
       seen.add(name);
+      const wire = toolWireName(name);
+      if (wireToName.has(wire)) {
+        throw new Error(`Tool name alias collision: ${name}`);
+      }
+      wireToName.set(wire, name);
       if (typeof tool.description !== "string") {
         throw new Error(`Tool description must be a string: ${name}`);
       }
-      if (tool.constrainedSampling) {
+      const constrained = (tool as { constrainedSampling?: unknown }).constrainedSampling;
+      if (constrained) {
         // Grammar variants are optional provider-specific encodings. Like
         // Pi's Anthropic adapter, use the tool's JSON schema when grammar
         // decoding is unavailable. Best-effort strict schemas also fall back
         // to normal tool calling; required strict schemas stay rejected.
         // Malformed native input still fails downstream in parseToolInput.
-        const sampling = tool.constrainedSampling as { type?: unknown; strict?: unknown };
+        const sampling = constrained as { type?: unknown; strict?: unknown };
         const bestEffort =
           sampling.type === "grammar" ||
           (sampling.type === "json_schema" && sampling.strict === "prefer");
@@ -177,9 +235,9 @@ export function buildRequestBody(options: {
       // JSON round-trip drops typebox symbols and undefined fields.
       const raw = tool.parameters === undefined ? { type: "object" } : tool.parameters;
       const schema = normalizeInputSchema(JSON.parse(JSON.stringify(raw)) as unknown);
-      manifest.push({ name, description: tool.description, inputSchema: schema });
+      manifest.push({ name: wire, description: tool.description, inputSchema: schema });
       bodyTools.push({
-        name: toolPrefixedName(name),
+        name: toolPrefixedName(wire),
         description: tool.description,
         input_schema: schema,
       });
@@ -189,13 +247,13 @@ export function buildRequestBody(options: {
 
   const body: Record<string, unknown> = { tools: bodyTools };
 
-  // Pi has no thinking-off level: an undefined reasoning keeps native
-  // defaults (best-effort mirror of the reference implementation).
-  if (options.reasoning !== undefined) {
-    const mapped = options.thinkingLevelMap?.[options.reasoning];
-    // Native Claude Code owns thinking mode. Only send a verified effort.
-    if (mapped !== undefined && mapped !== null) {
-      body["output_config"] = { effort: mapped };
+  // An undefined reasoning keeps native defaults. Native Claude Code owns
+  // thinking mode; only an effort the catalog verified for this model is sent.
+  // OMP's `minimal` has no native counterpart and maps to `low`.
+  if (options.reasoning !== undefined && !options.disableReasoning) {
+    const wanted: string = options.reasoning === "minimal" ? "low" : options.reasoning;
+    if (options.efforts?.includes(wanted)) {
+      body["output_config"] = { effort: wanted };
     }
   }
 
@@ -207,7 +265,7 @@ export function buildRequestBody(options: {
   }
   // Subscription routes reject sampling controls, so temperature/top_p from
   // Pi options are intentionally dropped, never forwarded.
-  return { body, manifest, toolNames };
+  return { body, manifest, toolNames, wireToName };
 }
 
 
@@ -241,15 +299,33 @@ export function writeRequestFiles(
     mode: 0o600,
   });
   writeFileSync(mcpPath, INERT_MCP_SOURCE, { encoding: "utf-8", mode: 0o600 });
+  const runtime = mcpRuntime();
   const mcpConfigJson = JSON.stringify({
     mcpServers: {
       [MCP_SERVER_NAME]: {
-        command: process.execPath,
+        command: runtime.command,
         args: [mcpPath, toolsPath],
+        ...(runtime.env ? { env: runtime.env } : {}),
       },
     },
   });
   return { systemPath, settingsPath, toolsPath, mcpPath, mcpConfigJson };
+}
+
+/**
+ * Interpreter for the inert MCP script. OMP ships as a Bun single-file
+ * executable, so `process.execPath` is the `omp` binary itself and would
+ * treat the script path as an OMP argument. `BUN_BE_BUN=1` makes such a
+ * binary behave as the embedded `bun` CLI. A plain Node or Bun host keeps
+ * using its own executable. `CLAUDE_DIRECTSDK_MCP_RUNTIME` overrides both.
+ */
+export function mcpRuntime(): { command: string; env?: Record<string, string> } {
+  const override = process.env["CLAUDE_DIRECTSDK_MCP_RUNTIME"];
+  if (override) {
+    return { command: override };
+  }
+  const isBun = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
+  return isBun ? { command: process.execPath, env: { BUN_BE_BUN: "1" } } : { command: process.execPath };
 }
 
 /**
@@ -313,7 +389,7 @@ export function buildChildEnv(options: {
   relayUrl: string;
   body: Record<string, unknown>;
 }): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...options.baseEnv };
+  const env: NodeJS.ProcessEnv = stripConflictingEnv(options.baseEnv);
   const config = env["CLAUDE_DIRECTSDK_CONFIG_DIR"];
   if (config) {
     env["CLAUDE_CONFIG_DIR"] = config;

@@ -9,8 +9,8 @@
  */
 
 import { ChildProcess, spawn, spawnSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -301,9 +301,15 @@ let stableCwd: string | null = null;
 
 export function stableChildCwd(): string {
   if (!stableCwd) {
-    // A fresh tempdir per request moves the native cache prefix every round
-    // and destroys prompt-cache reuse; one stable cwd per process keeps it.
-    stableCwd = mkdtempSync(join(tmpdir(), "pi-directsdk-cwd-"));
+    // The native child writes its cwd into the first user message and the
+    // environment system block, so the cwd is part of every cached prefix.
+    // A per-process tempdir still breaks reuse when OMP restarts or resumes a
+    // session; a fixed directory keeps the prefix identical across processes.
+    // The child runs with no native tools and no session persistence, so
+    // concurrent OMP processes never write into it.
+    const dir = process.env["CLAUDE_DIRECTSDK_CWD"] || join(homedir(), ".cache", "omp-claude-directsdk", "cwd");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    stableCwd = dir;
   }
   return stableCwd;
 }

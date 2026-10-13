@@ -14,12 +14,29 @@
 import { IncomingMessage, Server, ServerResponse, createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { relocateHistoryBreakpoint, relocationEnabled } from "./cache-breakpoint.js";
+import { isTestUpstream } from "./request.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { Socket } from "node:net";
+import { join } from "node:path";
 import { NativeAssistantMessage, NativeUsage, deepClone, isRecord } from "./types.js";
 
 const ERROR_BODY_CAP = 64 * 1024;
 const REQUEST_BODY_CAP = 512 * 1024 * 1024;
+
+/** Relay failure marker for a request that carried non-subscription credentials. */
+export const AUTH_REFUSED = "NON_SUBSCRIPTION_AUTH_REFUSED";
+
+/** Claude subscription OAuth tokens (login or `claude setup-token`) use this prefix. */
+const SUBSCRIPTION_BEARER = /^Bearer sk-ant-oat/;
+
+/** True only for a request authenticated by a subscription OAuth bearer and nothing else. */
+export function isSubscriptionAuth(headers: IncomingMessage["headers"]): boolean {
+  if (headers["x-api-key"] !== undefined) return false;
+  const auth = headers["authorization"];
+  return typeof auth === "string" && SUBSCRIPTION_BEARER.test(auth);
+}
 
 /** Reconstructed upstream assistant message from the SSE stream. */
 export class SseCapture {
@@ -305,6 +322,28 @@ export class AdmissionRelay {
     });
   }
 
+  /**
+   * OMP port: the relay forwards only subscription OAuth requests. An API key
+   * (`x-api-key`) or any other bearer never reaches upstream, even if one
+   * leaks into the child environment past stripConflictingEnv. Explicit test
+   * mode keeps fixture credentials working.
+   */
+  private refuseNonSubscriptionAuth(req: IncomingMessage, res: ServerResponse): boolean {
+    if (isTestUpstream(process.env) || isSubscriptionAuth(req.headers)) return false;
+    req.resume();
+    this.failure = AUTH_REFUSED;
+    const body = Buffer.from(
+      `{"type":"error","error":{"type":"authentication_error","message":"${AUTH_REFUSED}"}}`,
+    );
+    res.writeHead(401, {
+      "Content-Type": "application/json",
+      "Content-Length": body.length,
+      Connection: "close",
+    });
+    res.end(body);
+    return true;
+  }
+
   private deny(res: ServerResponse): void {
     this.denied += 1;
     const body = Buffer.from(
@@ -354,6 +393,9 @@ export class AdmissionRelay {
     }
     this.used = true;
     this.track(req.socket);
+    if (this.refuseNonSubscriptionAuth(req, res)) {
+      return;
+    }
 
     let body: Buffer;
     try {
@@ -363,6 +405,20 @@ export class AdmissionRelay {
       res.writeHead(400, { Connection: "close" });
       res.end();
       return;
+    }
+    // OMP port: the only edit to the native body. See cache-breakpoint.ts.
+    if (relocationEnabled(process.env)) {
+      body = relocateHistoryBreakpoint(body, req.headers);
+    }
+    // Debug aid for prompt-cache analysis: the forwarded body only, never headers.
+    const dumpDir = process.env["CLAUDE_DIRECTSDK_DEBUG_DUMP_DIR"];
+    if (dumpDir) {
+      try {
+        mkdirSync(dumpDir, { recursive: true, mode: 0o700 });
+        writeFileSync(join(dumpDir, `body-${Date.now()}-${process.pid}.json`), body, { mode: 0o600 });
+      } catch {
+        // Diagnostics must never affect the request.
+      }
     }
 
     try {

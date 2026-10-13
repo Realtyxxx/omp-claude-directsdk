@@ -7,34 +7,31 @@
  * stream events. Pi alone executes tools: native tool calls are published
  * only after the first upstream response is complete, usage and stop reason
  * are captured, and the child has exited.
+ *
+ * OMP port: OMP hands custom APIs its raw `Context` (system prompt as a list
+ * of sections, tools as an array) rather than upstream Pi's transcript form.
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  calculateCost,
-  collapseSystemMessages,
-  createAssistantMessageEventStream,
-  getCurrentSystemPrompt,
-  getCurrentTools,
-} from "@earendil-works/pi-ai/compat";
+// pi-ai re-exports calculateCost only through OMP's legacy shim; its home is pi-catalog.
+import { calculateCost } from "@oh-my-pi/pi-catalog/models";
+import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import type {
   Api,
   AssistantMessage,
   AssistantMessageEventStream,
-  JsonObject,
+  Context,
   Model,
   SimpleStreamOptions,
   ThinkingContent,
   ToolCall,
-  TranscriptContext,
-} from "@earendil-works/pi-ai/compat";
-import { AdmissionRelay } from "./admission.js";
+} from "@oh-my-pi/pi-ai";
+import { AUTH_REFUSED, AdmissionRelay } from "./admission.js";
 import {
   DirectSdkError,
   cancelledError,
-  envConflictError,
   incompleteError,
   isCancelled,
   loggedOutError,
@@ -52,7 +49,7 @@ import {
   buildArgv,
   buildChildEnv,
   buildRequestBody,
-  checkEnvConflicts,
+  isTestUpstream,
   toolBareName,
   writeRequestFiles,
 } from "./request.js";
@@ -73,6 +70,15 @@ import {
 
 const DEFAULT_TIMEOUT_MS = 180_000;
 const NATIVE_API = "claude-directsdk";
+const ANTHROPIC_UPSTREAM = "https://api.anthropic.com";
+
+type JsonObject = Record<string, unknown>;
+
+/** Native effort levels this model supports, recorded by the catalog in `thinking.efforts`. */
+function nativeEfforts(model: Model<Api>): string[] {
+  const efforts = model.thinking?.efforts ?? [];
+  return efforts.map((effort) => (effort === "minimal" ? "low" : effort));
+}
 
 export interface CallDeps {
   spawn: (options: {
@@ -134,10 +140,12 @@ function mapUsage(usage: NativeUsage | undefined): AssistantMessage["usage"] | n
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
   if (cacheWrite1h !== undefined) {
-    mapped.cacheWrite1h = cacheWrite1h;
+    // OMP prices 1-hour cache writes from this TTL breakdown.
+    const cacheWrite5m = toNumber(usage?.cache_creation?.ephemeral_5m_input_tokens) ?? undefined;
+    mapped.cttl = { ephemeral1h: cacheWrite1h, ...(cacheWrite5m !== undefined ? { ephemeral5m: cacheWrite5m } : {}) };
   }
   if (reasoning !== undefined) {
-    mapped.reasoning = reasoning;
+    mapped.reasoningTokens = reasoning;
   }
   return mapped;
 }
@@ -196,7 +204,7 @@ interface PendingTool {
 
 export function streamClaudeDirectSdk(
   model: Model<Api>,
-  context: TranscriptContext,
+  context: Context,
   options?: SimpleStreamOptions,
   deps: CallDeps = defaultDeps,
 ): AssistantMessageEventStream {
@@ -210,7 +218,7 @@ export function streamClaudeDirectSdk(
 
 async function executeCall(
   model: Model<Api>,
-  context: TranscriptContext,
+  context: Context,
   options: SimpleStreamOptions,
   stream: AssistantMessageEventStream,
   deps: CallDeps,
@@ -222,7 +230,8 @@ async function executeCall(
     provider: PROVIDER_ID,
     model: model.id,
     usage: zeroUsage(),
-    stopReason: "pending",
+    // Placeholder until the native stop reason arrives; OMP has no pending state.
+    stopReason: "stop",
     timestamp: Date.now(),
   };
   let started = false;
@@ -266,27 +275,22 @@ async function executeCall(
   }
 
   try {
-    const mergedEnv: NodeJS.ProcessEnv = { ...process.env, ...options.env };
-    const conflicts = checkEnvConflicts(mergedEnv);
-    if (conflicts.length > 0) {
-      throw envConflictError(conflicts);
-    }
-    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-      throw new Error("timeoutMs must be positive milliseconds");
-    }
+    // Conflicting auth/backend variables are stripped from the child env in
+    // buildChildEnv, so an exported ANTHROPIC_API_KEY can never bill here.
+    const mergedEnv: NodeJS.ProcessEnv = { ...process.env };
+    const timeoutMs = DEFAULT_TIMEOUT_MS;
 
-    const collapsed = collapseSystemMessages(context);
-    const systemPrompt = getCurrentSystemPrompt(collapsed.messages);
-    const tools = getCurrentTools(collapsed.messages);
-    const history = collapsed.messages.filter((m) => m.role !== "system");
-    const nativeModelId = nativeModel(model.id, model.contextWindow);
+    const systemPrompt = (context.systemPrompt ?? []).filter((part) => part.length > 0).join("\n\n");
+    const tools = context.tools ?? [];
+    const history = context.messages;
+    const nativeModelId = nativeModel(model.id, model.contextWindow ?? 0);
     const build = buildRequestBody({
       tools,
       toolChoice: options.toolChoice,
       reasoning: options.reasoning,
-      thinkingLevelMap: model.thinkingLevelMap,
-      maxTokens: options["maxTokens"] as number | undefined,
+      disableReasoning: options.disableReasoning,
+      efforts: nativeEfforts(model),
+      maxTokens: options.maxTokens,
     });
     const { frames } = prepareHistory(history, new Set(build.toolNames));
 
@@ -314,7 +318,11 @@ async function executeCall(
         `Unsupported claude version: this provider qualifies ${QUALIFIED_CLI_RANGE}`,
       );
     }
-    const upstream = mergedEnv["ANTHROPIC_BASE_URL"] || "https://api.anthropic.com";
+    // Only explicit test mode may redirect the subscription token elsewhere;
+    // an ANTHROPIC_BASE_URL exported for OMP's own providers must not.
+    const upstream = isTestUpstream(mergedEnv)
+      ? mergedEnv["ANTHROPIC_BASE_URL"] || ANTHROPIC_UPSTREAM
+      : ANTHROPIC_UPSTREAM;
 
     requestDir = deps.makeRequestDir();
     const files = writeRequestFiles(requestDir, {
@@ -468,7 +476,6 @@ async function executeCall(
                 type: "thinking",
                 thinking: "[Reasoning redacted]",
                 thinkingSignature: typeof block["data"] === "string" ? block["data"] : "",
-                redacted: true,
               });
               progressive.push({
                 kind: "thinking",
@@ -608,6 +615,11 @@ async function executeCall(
       ...(Array.isArray(result["errors"]) ? result["errors"].filter((value): value is string => typeof value === "string") : []),
     ].join("; ");
     if (used) {
+      if (relay.failure === AUTH_REFUSED) {
+        throw loggedOutError(
+          "the request was not authenticated by a Claude subscription login (API key or other credential refused; nothing was sent upstream)",
+        );
+      }
       if (relay.status !== 200 || !relay.capture.complete || !relay.capture.message) {
         throw upstreamError(
           `first upstream attempt: status ${relay.status ?? "unknown"}, ` +
@@ -634,7 +646,7 @@ async function executeCall(
         if (/prompt is too long|context_length_exceeded/i.test(resultErrors)) {
           throw nativeError(
             `context_length_exceeded: ${resultErrors}. Model ${model.id} uses native route ${nativeModelId} ` +
-            `with a configured context window of ${model.contextWindow.toLocaleString("en-US")} tokens. ` +
+            `with a configured context window of ${(model.contextWindow ?? 0).toLocaleString("en-US")} tokens. ` +
             "Check this model's contextWindow override in models.json or compact the session.",
           );
         }
@@ -680,10 +692,8 @@ async function executeCall(
     }
     const responseModel = authoritative.model ?? streamModel;
     if (responseModel && responseModel !== model.id) {
-      output.responseModel = responseModel;
+      output.upstreamModel = responseModel;
     }
-    output.rawStopReason = authoritative.stop_reason ?? streamStop ?? result?.subtype ?? "unknown";
-    output.endTurn = (authoritative.stop_reason ?? streamStop) === "end_turn";
 
     // Reconcile progressive text/thinking with the authoritative message,
     // then close every open block and publish tool calls.
@@ -754,7 +764,8 @@ async function executeCall(
     for (const block of calls) {
       const raw = block as unknown as Record<string, unknown>;
       const name = typeof raw["name"] === "string" ? raw["name"] : "";
-      const bare = toolBareName(name);
+      const wire = toolBareName(name);
+      const bare = wire === null ? undefined : build.wireToName.get(wire);
       if (!bare || !build.toolNames.includes(bare)) {
         throw new DirectSdkError(
           "native",
@@ -797,22 +808,16 @@ async function executeCall(
 
     const projection = messageProjection(output);
     const natives = used && relay.capture.message ? [relay.capture.message] : assistants;
-    output.diagnostics = [
-      encodeCarrier(natives, projection),
-      {
-        type: "pi-claude-directsdk/meta",
-        timestamp: Date.now(),
-        details: {
-          nativeModel: nativeModelId,
-          requestId: relay.requestId ?? "",
-          upstreamRequests: used ? 1 : 0,
-          blockedRequests: relay.denied,
-          nativeCostUsd: typeof result?.total_cost_usd === "number" ? result.total_cost_usd : -1,
-          nativeCostNote: "estimate, not subscription charge",
-          cliAvailable: true,
-        },
-      },
-    ];
+    // OMP's ProviderPayload union is closed; the carrier is plain JSON data
+    // that OMP persists and passes back unchanged on replay.
+    output.providerPayload = encodeCarrier(natives, projection, {
+      nativeModel: nativeModelId,
+      requestId: relay.requestId ?? "",
+      upstreamRequests: used ? 1 : 0,
+      blockedRequests: relay.denied,
+      nativeCostUsd: typeof result?.total_cost_usd === "number" ? result.total_cost_usd : -1,
+      nativeCostNote: "estimate, not subscription charge",
+    }) as unknown as NonNullable<AssistantMessage["providerPayload"]>;
 
     if (output.stopReason === "error") {
       stream.push({ type: "error", reason: "error", error: output });

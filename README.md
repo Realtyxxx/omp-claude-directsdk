@@ -1,5 +1,10 @@
 # Pi Claude DirectSDK
 
+> **OMP port (`omp-port` branch):** this checkout runs inside OMP
+> (`@oh-my-pi/pi-coding-agent`) rather than upstream Pi. See
+> [docs/omp-port.md](docs/omp-port.md) for installation, the changes from
+> upstream, and the prompt-cache fix.
+
 [![npm version](https://img.shields.io/npm/v/pi-claude-directsdk.svg)](https://www.npmjs.com/package/pi-claude-directsdk)
 
 Use Claude inside Pi through the unmodified Claude Code executable. Pi owns the transcript, tools, approvals, and retries. The CLI supplies subscription authentication as a model transport.

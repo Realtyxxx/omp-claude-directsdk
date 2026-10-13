@@ -1,10 +1,10 @@
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/compat";
+import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import type {
   Api,
   AssistantMessage,
   AssistantMessageEventStream,
   Model,
-} from "@earendil-works/pi-ai/compat";
+} from "@oh-my-pi/pi-ai";
 
 /** Load the transport on demand and report setup failures through its stream. */
 export function lazyStream(

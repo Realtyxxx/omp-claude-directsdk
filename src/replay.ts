@@ -10,17 +10,17 @@
  * history is rejected, never flattened into prose. Signed native
  * thinking survives only inside a durable carrier attached to the Pi
  * assistant message, and only while the visible projection is unchanged.
+ *
+ * OMP port: OMP's AssistantMessage has no `diagnostics` list, so the carrier
+ * lives in `providerPayload`, the slot OMP reserves for transport-native
+ * history. OMP drops that payload on some rewrites (image budgeting, share
+ * export); replay then falls back to text, exactly as for a stale carrier.
  */
 
 import { createHash } from "node:crypto";
-import type {
-  AssistantMessage,
-  AssistantMessageDiagnostic,
-  JsonObject,
-  Message,
-} from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage, Message } from "@oh-my-pi/pi-ai";
 import { replayError } from "./errors.js";
-import { toolPrefixedName } from "./request.js";
+import { toolPrefixedName, toolWireName } from "./request.js";
 import {
   NativeAssistantMessage,
   NativeContentBlock,
@@ -29,9 +29,18 @@ import {
   isRecord,
 } from "./types.js";
 
-/** Diagnostics type carrying preserved native assistant blocks. */
-export const CARRIER_TYPE = "pi-claude-directsdk/native";
+/** `providerPayload.type` carrying preserved native assistant blocks. */
+export const CARRIER_TYPE = "claudeDirectSdkNative";
 const CARRIER_VERSION = 1;
+
+/** Carrier stored in `AssistantMessage.providerPayload`. */
+export interface CarrierPayload {
+  type: typeof CARRIER_TYPE;
+  version: number;
+  messages: unknown[];
+  projection: CarrierProjection;
+  meta?: Record<string, unknown>;
+}
 
 export interface CarrierProjection {
   text: string;
@@ -95,15 +104,8 @@ function readCarrier(message: AssistantMessage): {
   messages: NativeAssistantMessage[];
   projection: CarrierProjection;
 } | null {
-  const carriers = (message.diagnostics ?? []).filter(
-    (d): d is AssistantMessageDiagnostic =>
-      isRecord(d) && d["type"] === CARRIER_TYPE,
-  );
-  if (carriers.length !== 1) {
-    return null;
-  }
-  const details = carriers[0]?.details as Record<string, unknown> | undefined;
-  if (!isRecord(details) || details["version"] !== CARRIER_VERSION) {
+  const details: unknown = message.providerPayload;
+  if (!isRecord(details) || details["type"] !== CARRIER_TYPE || details["version"] !== CARRIER_VERSION) {
     return null;
   }
   if (!Array.isArray(details["messages"]) || !isRecord(details["projection"])) {
@@ -123,16 +125,18 @@ function readCarrier(message: AssistantMessage): {
 export function encodeCarrier(
   natives: NativeAssistantMessage[],
   projection: CarrierProjection,
-): AssistantMessageDiagnostic {
-  // A JSON round-trip keeps the diagnostic within pi-ai's JsonValue type.
-  const details = JSON.parse(
+  meta?: Record<string, unknown>,
+): CarrierPayload {
+  // A JSON round-trip keeps the payload plain data for session persistence.
+  return JSON.parse(
     JSON.stringify({
+      type: CARRIER_TYPE,
       version: CARRIER_VERSION,
       messages: natives,
       projection,
+      ...(meta ? { meta } : {}),
     }),
-  ) as JsonObject;
-  return { type: CARRIER_TYPE, timestamp: Date.now(), details };
+  ) as CarrierPayload;
 }
 
 function toNativeImage(data: string, mimeType: string): NativeContentBlock {
@@ -191,8 +195,9 @@ export function prepareHistory(
 
   for (const message of messages) {
     switch (message.role) {
-      case "system":
-        throw replayError("System messages must precede conversation history");
+      // OMP-only role for injected harness context; Claude has no developer
+      // turn, so it replays as user content in place.
+      case "developer":
       case "user": {
         const blocks: NativeContentBlock[] = [];
         if (typeof message.content === "string") {
@@ -249,9 +254,19 @@ export function prepareHistory(
             blocks.push({
               type: "tool_use",
               id: nativeToolId(block.id),
-              name: toolPrefixedName(block.name),
+              name: toolPrefixedName(toolWireName(block.name)),
               input: deepClone(block.arguments),
             });
+          } else if (
+            block.type === "redactedThinking" ||
+            block.type === "fallback" ||
+            block.type === "anthropicServerTool" ||
+            block.type === "image"
+          ) {
+            // Provider-bound blocks from OMP's own Anthropic transport (or
+            // generated images) cannot cross into a native replay. Dropping
+            // them matches OMP's own cross-provider transformMessages.
+            continue;
           } else {
             throw replayError(
               `Unsupported assistant content block: ${(block as { type: string }).type}`,

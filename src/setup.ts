@@ -7,6 +7,7 @@ import { accessSync, constants } from "node:fs";
 import { delimiter, join } from "node:path";
 import { LOGIN_HINT, INSTALL_HINT } from "./errors.js";
 import { parseCliVersion, cliVersionSupported } from "./models.js";
+import { stripConflictingEnv } from "./request.js";
 
 export interface SetupStatus {
   available: boolean;
@@ -73,7 +74,8 @@ function findOnPath(name: string, env: NodeJS.ProcessEnv): string | undefined {
 
 /** Child environment for setup probes. Never forwards the override variable itself. */
 export function setupChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const child: NodeJS.ProcessEnv = { ...env };
+  // Probes must see the same login the request child uses, never an API key.
+  const child: NodeJS.ProcessEnv = stripConflictingEnv(env);
   const config = child["CLAUDE_DIRECTSDK_CONFIG_DIR"];
   delete child["CLAUDE_DIRECTSDK_CONFIG_DIR"];
   if (config) {

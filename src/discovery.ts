@@ -94,7 +94,10 @@ export async function discoverModels(signal: AbortSignal): Promise<DiscoveredMod
       await child.wait();
     }
     guard.closeAllConnections();
-    await new Promise<void>((resolve, reject) => guard.close(error => error ? reject(error) : resolve()));
+    // Some Bun releases stop the server inside closeAllConnections(); a second
+    // close then fails with ERR_SERVER_NOT_RUNNING and would mask the result.
+    await new Promise<void>((resolve, reject) => guard.close(error =>
+      error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING" ? reject(error) : resolve()));
     if (cwd) await rm(cwd, { recursive: true, force: true });
   }
 }

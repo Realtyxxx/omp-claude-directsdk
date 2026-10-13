@@ -1,22 +1,22 @@
-/** Claude CLI supplies authentication; Pi owns the transcript and tools. */
-import { normalizeContext, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
-import type { SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createDirectSdkProvider, PROVIDER_ID, streamSimple } from "../../src/provider.js";
+/** Claude CLI supplies authentication; OMP owns the transcript and tools. */
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { createProviderConfig, PROVIDER_ID } from "../../src/provider.js";
 
 export default function (pi: ExtensionAPI) {
-  let report = (message: string): void => { console.error(message); };
+  // Catalog refresh can finish before any session exists; hold its warnings
+  // until a session can show them instead of writing over the TUI.
+  const pending: string[] = [];
+  let notify: ((message: string) => void) | undefined;
+  const report = (message: string): void => {
+    if (notify) notify(message);
+    else pending.push(message);
+  };
   pi.on("session_start", (_event, context) => {
-    report = context.hasUI
-      ? message => context.ui.notify(message, "warning")
-      : message => { console.error(message); };
+    const sink = context.hasUI
+      ? (message: string) => context.ui.notify(message, "warning")
+      : (message: string) => { console.error(message); };
+    notify = sink;
+    for (const message of pending.splice(0)) sink(message);
   });
-  // Pi can dispatch a selected or overridden model while the live catalog is empty.
-  registerApiProvider({
-    api: PROVIDER_ID,
-    stream: (model, context, options) => streamSimple(model, normalizeContext(context), options as SimpleStreamOptions),
-    streamSimple: (model, context, options) => streamSimple(model, normalizeContext(context), options),
-  }, PROVIDER_ID);
-  pi.on("session_shutdown", () => { unregisterApiProviders(PROVIDER_ID); });
-  pi.registerProvider(createDirectSdkProvider(message => report(message)));
+  pi.registerProvider(PROVIDER_ID, createProviderConfig(report));
 }
