@@ -11,6 +11,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { PROVIDER_ID } from "./models.js";
 import { lazyStream } from "./lazy-stream.js";
+import { claudeDirectSdkUsage } from "./usage.js";
 import type { ChatModel } from "./web-catalog.js";
 
 export { PROVIDER_ID };
@@ -31,6 +32,7 @@ export function createProviderConfig(report: (message: string) => void) {
     baseUrl: "process://claude-directsdk",
     apiKey: CLI_LOGIN_PLACEHOLDER,
     streamSimple,
+    usage: claudeDirectSdkUsage,
     async fetchDynamicModels(): Promise<ChatModel[]> {
       const signal = AbortSignal.timeout(CATALOG_DEADLINE_MS);
       try {
