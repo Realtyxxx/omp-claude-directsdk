@@ -274,11 +274,12 @@ export function prepareHistory(
           }
         }
         if (blocks.length === 0) {
-          // Interrupted responses can contain empty text or thinking placeholders.
-          if (message.stopReason === "error" || message.stopReason === "aborted") {
-            break;
-          }
-          throw replayError("Empty assistant message cannot be replayed");
+          // Nothing the model could read: interrupted responses, and the
+          // in-flight partial that OMP side requests (/btw, ephemeral turns)
+          // snapshot while its only content is an empty thinking placeholder.
+          // Neighboring user content merges, so dropping keeps the transcript
+          // well formed.
+          break;
         }
         frames.push({ type: "assistant", message: { role: "assistant", content: blocks } });
         break;
