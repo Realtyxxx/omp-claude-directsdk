@@ -111,7 +111,7 @@ This runs offline startup verification through your installed Pi and consumes no
 
 ## Subscription usage
 
-`/usage` shows the Claude subscription windows (5-hour, 7-day, per-model weekly) for `claude-directsdk`. The extension reads the access token the Claude CLI keeps in `$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`) and queries Anthropic's OAuth usage endpoint. It never refreshes or writes the token; when it has expired, run any `claude` command to renew it and `/usage` skips the provider until then.
+`/usage` shows the Claude subscription windows (5-hour, 7-day, per-model weekly) for `claude-directsdk`. The extension reads the access token the Claude CLI keeps in `$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`), or on macOS in the login Keychain item `Claude Code-credentials` (default config directory only), and queries Anthropic's OAuth usage endpoint. It never refreshes or writes the token; when it has expired, run any `claude` command to renew it and `/usage` skips the provider until then.
 
 ## Costs
 
