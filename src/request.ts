@@ -76,6 +76,12 @@ export function isTestUpstream(env: NodeJS.ProcessEnv): boolean {
  */
 export function stripConflictingEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = { ...env };
+  // The child talks to the loopback relay (or discovery guard); a proxy
+  // exported for the user's shell must never carry that traffic.
+  for (const name of ["NO_PROXY", "no_proxy"]) {
+    const current = out[name]?.trim();
+    out[name] = current ? `${current},127.0.0.1,localhost,::1` : "127.0.0.1,localhost,::1";
+  }
   for (const name of NESTED_SESSION_VARS) {
     delete out[name];
   }

@@ -52,6 +52,18 @@ Subagents use their role model. To run them through this provider, set
 `PI_DIRECTSDK_TEST_UPSTREAM=1` disables layers 1 to 3 for fixtures; never set
 it in normal use.
 
+## Proxies
+
+The relay, not the child, connects to `api.anthropic.com`, and `node:https`
+ignores proxy variables. On a region-blocked host (direct access answers
+`403 Request not allowed`) the relay therefore tunnels itself:
+`https_proxy`/`HTTPS_PROXY` through HTTP CONNECT, otherwise
+`all_proxy`/`ALL_PROXY` through HTTP CONNECT or SOCKS5, honoring
+`no_proxy`/`NO_PROXY`. The child's `NO_PROXY` always gains `127.0.0.1`,
+`localhost` and `::1` so its loopback traffic to the relay never goes
+through a proxy. Model discovery uses Bun's `fetch`, which already honors
+the proxy variables.
+
 ## What the child ignores
 
 The child runs with `--setting-sources ""`, `--strict-mcp-config`,

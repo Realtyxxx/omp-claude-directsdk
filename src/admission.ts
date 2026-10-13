@@ -13,9 +13,10 @@
 
 import { IncomingMessage, Server, ServerResponse, createServer } from "node:http";
 import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
+import { request as httpsRequest, type RequestOptions } from "node:https";
 import { relocateHistoryBreakpoint, relocationEnabled } from "./cache-breakpoint.js";
 import { isTestUpstream } from "./request.js";
+import { describeProxy, openProxiedTls, resolveUpstreamProxy } from "./upstream-proxy.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { Socket } from "node:net";
@@ -424,7 +425,8 @@ export class AdmissionRelay {
     try {
       await this.forward(req, res, body);
     } catch (error) {
-      this.failure = error instanceof Error ? error.name : String(error);
+      // Keep a specific diagnosis (proxy tunnel failure) set by forward().
+      this.failure ??= error instanceof Error ? error.name : String(error);
       if (!res.headersSent) {
         res.writeHead(502, { Connection: "close" });
       }
@@ -438,11 +440,27 @@ export class AdmissionRelay {
     }
   }
 
-  private forward(
+  private async forward(
     req: IncomingMessage,
     res: ServerResponse,
     body: Buffer,
   ): Promise<void> {
+    // OMP port: node:https ignores proxy variables, so tunnel explicitly when
+    // the user's environment routes HTTPS through a proxy.
+    const proxy =
+      this.target.scheme === "https:"
+        ? resolveUpstreamProxy(this.target.host, process.env)
+        : undefined;
+    let tunnel: Socket | undefined;
+    if (proxy) {
+      try {
+        tunnel = await openProxiedTls(proxy, this.target.host, this.target.port, this.timeoutMs);
+      } catch (error) {
+        this.failure = `proxy ${describeProxy(proxy)}: ${error instanceof Error ? error.message : String(error)}`;
+        throw error;
+      }
+      this.track(tunnel);
+    }
     return new Promise((resolve, reject) => {
       const headers: Record<string, string | string[]> = {};
       for (const [key, value] of Object.entries(req.headers)) {
@@ -454,15 +472,20 @@ export class AdmissionRelay {
       headers["accept-encoding"] = "identity";
       const send =
         this.target.scheme === "https:" ? httpsRequest : httpRequest;
+      const options: RequestOptions = {
+        host: this.target.host,
+        port: this.target.port,
+        path: `${this.target.path}/v1/messages`,
+        method: "POST",
+        headers: { ...headers, "content-length": body.length },
+        timeout: this.timeoutMs,
+      };
+      if (tunnel) {
+        const socket = tunnel;
+        options.createConnection = () => socket;
+      }
       const upstream = send(
-        {
-          host: this.target.host,
-          port: this.target.port,
-          path: `${this.target.path}/v1/messages`,
-          method: "POST",
-          headers: { ...headers, "content-length": body.length },
-          timeout: this.timeoutMs,
-        },
+        options,
         (upstreamRes) => {
           this.status = upstreamRes.statusCode ?? null;
           this.requestId =
