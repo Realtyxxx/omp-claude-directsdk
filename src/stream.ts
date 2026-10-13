@@ -51,6 +51,7 @@ import {
   buildRequestBody,
   isTestUpstream,
   toolBareName,
+  toolPrefixedName,
   writeRequestFiles,
 } from "./request.js";
 import { qualifiedCli, resolveClaude } from "./setup.js";
@@ -764,12 +765,14 @@ async function executeCall(
     for (const block of calls) {
       const raw = block as unknown as Record<string, unknown>;
       const name = typeof raw["name"] === "string" ? raw["name"] : "";
-      const wire = toolBareName(name);
+      // The model sometimes drops the MCP prefix; accept only exact advertised wire names.
+      const wire = toolBareName(name) ?? (build.wireToName.has(name) ? name : null);
       const bare = wire === null ? undefined : build.wireToName.get(wire);
       if (!bare || !build.toolNames.includes(bare)) {
         throw new DirectSdkError(
           "native",
-          "Native returned a tool outside the current host inventory",
+          `Native returned a tool outside the current host inventory: ${JSON.stringify(name)} ` +
+          `(advertised: ${describeInventory(build.wireToName.keys())})`,
         );
       }
       const parsed = parseToolInput(raw["input"]);
@@ -930,6 +933,16 @@ function textOf(message: NativeAssistantMessage): string {
 function refusalText(message: NativeAssistantMessage): string {
   const text = textOf(message);
   return text || "The model refused to complete the request";
+}
+
+const INVENTORY_LIMIT = 40;
+
+/** Native names (`mcp__pi__<wire>`) advertised to the child, capped for readability. */
+export function describeInventory(wires: Iterable<string>): string {
+  const names = Array.from(wires, toolPrefixedName);
+  if (names.length === 0) return "none";
+  const shown = names.slice(0, INVENTORY_LIMIT).join(", ");
+  return names.length > INVENTORY_LIMIT ? `${shown}, … ${names.length - INVENTORY_LIMIT} more` : shown;
 }
 
 function parseToolInput(input: unknown): JsonObject {

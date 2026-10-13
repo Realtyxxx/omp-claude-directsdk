@@ -57,6 +57,17 @@ Private artifacts go to `/tmp/pi-directsdk-verify-*`. The harness removes copied
 
 The observer records real Claude process starts, replay acknowledgments, terminal result errors, and exits. It does not substitute native responses or alter the provider request. Automatic Pi retries, if enabled in the user’s settings, can consume additional allowance.
 
+## Native tool exposure probe
+
+This probe checks that the Claude child exposes no native tool to the model. It makes no model request.
+
+1. Build the child argv, environment, and request files with the real `buildArgv`, `buildChildEnv`, and `writeRequestFiles` from `src/request.ts`.
+2. Point `ANTHROPIC_BASE_URL` at a loopback HTTP server that records the body of `POST /v1/messages` (pattern: `src/discovery.ts`).
+3. Start the child and read the `tools` list from the stream-json `system/init` message on stdout. Read the tool names from the recorded request body `tools` array.
+4. Expect only `mcp__pi__*` names in both lists. Any other name is a leaked native tool.
+
+Re-run the probe on every CLI version bump.
+
 ## Build checks and CI
 
 ```sh

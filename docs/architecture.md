@@ -67,7 +67,7 @@ Each Pi model call owns one child in its own process group. Abort and failure ki
 
 ### Stream conversion (`src/stream.ts`)
 
-The provider converts child stdout `stream-json` to Pi events. Native result errors are preserved even when stderr is empty. Prompt-length errors report the selected route and configured context window. Native tool calls are published only after the first upstream response is complete and the child has exited. Usage and stop reason come from the authoritative native usage. Incomplete native or upstream responses produce `incomplete` or `upstream` errors.
+The provider converts child stdout `stream-json` to Pi events. Native result errors are preserved even when stderr is empty. Prompt-length errors report the selected route and configured context window. Native tool calls are published only after the first upstream response is complete and the child has exited. A tool call is accepted when its name is an advertised `mcp__pi__<name>`, or, because the model sometimes drops the prefix, exactly (case-sensitive) an advertised bare wire name such as `read`. Any other name (for example a native `Bash` or `Read`) fails the call with a `native` error that quotes the raw returned name and the advertised native names (capped at 40). Usage and stop reason come from the authoritative native usage. Incomplete native or upstream responses produce `incomplete` or `upstream` errors.
 
 ### Inert MCP (`src/inert-mcp.ts`)
 
