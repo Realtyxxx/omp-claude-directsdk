@@ -25,6 +25,8 @@ import { NativeAssistantMessage, NativeUsage, deepClone, isRecord } from "./type
 
 const ERROR_BODY_CAP = 64 * 1024;
 const REQUEST_BODY_CAP = 512 * 1024 * 1024;
+const PROXY_TUNNEL_ATTEMPTS = 4;
+const PROXY_RETRY_BASE_MS = 500;
 
 /** Relay failure marker for a request that carried non-subscription credentials. */
 export const AUTH_REFUSED = "NON_SUBSCRIPTION_AUTH_REFUSED";
@@ -453,11 +455,21 @@ export class AdmissionRelay {
         : undefined;
     let tunnel: Socket | undefined;
     if (proxy) {
-      try {
-        tunnel = await openProxiedTls(proxy, this.target.host, this.target.port, this.timeoutMs);
-      } catch (error) {
-        this.failure = `proxy ${describeProxy(proxy)}: ${error instanceof Error ? error.message : String(error)}`;
-        throw error;
+      // Some proxy nodes drop new tunnels in bursts, e.g. when /btw opens a
+      // second connection beside the main turn. Nothing has been sent
+      // upstream yet, so retrying the tunnel is safe.
+      for (let attempt = 1; ; attempt++) {
+        try {
+          tunnel = await openProxiedTls(proxy, this.target.host, this.target.port, this.timeoutMs);
+          break;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (attempt >= PROXY_TUNNEL_ATTEMPTS || req.socket.destroyed) {
+            this.failure = `proxy ${describeProxy(proxy)}: ${message} (after ${attempt} attempts)`;
+            throw error;
+          }
+          await new Promise((resolve) => setTimeout(resolve, PROXY_RETRY_BASE_MS * 2 ** (attempt - 1)));
+        }
       }
       this.track(tunnel);
     }
