@@ -113,11 +113,28 @@ OMP processes):
 Native writes use the 1-hour TTL, so without the fix every request re-wrote
 the whole conversation at the 1-hour write price.
 
+## Request compression
+
+Claude Code gzips large Messages bodies only when it talks to
+`api.anthropic.com` itself, so a body bound for the loopback relay always
+arrives as plain JSON. `src/request-gzip.ts` compresses on the public leg
+instead, after the breakpoint edit, following the CLI's default path: gzip at
+the zlib default level for bodies of at least 4096 bytes. When the API answers
+400, 403, or 415 with a request id that starts with `req_` (or a `cf-ray`
+header) and a "body is not valid JSON" message, the relay resends the body
+plain once and keeps the rest of the process on plain bodies.
+`CLAUDE_DIRECTSDK_DEBUG_DUMP_DIR` also records the wire encoding and sizes.
+
+Measured on `claude-haiku-5-5` (four continued turns): bodies of 68–73 KB went
+out as 27–30 KB, every request returned 200, and cache reads and writes
+matched an uncompressed run.
+
 ## Settings added by the port
 
 | Variable                            | Purpose                                                                                                |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `CLAUDE_DIRECTSDK_CACHE_RELOCATE=0` | Keep the native breakpoint placement.                                                                  |
+| `CLAUDE_DIRECTSDK_GZIP=0`           | Send the upstream body uncompressed (see below).                                                       |
 | `CLAUDE_DIRECTSDK_CWD`              | Override the fixed child working directory.                                                            |
 | `CLAUDE_DIRECTSDK_MCP_RUNTIME`      | Interpreter for the inert MCP script.                                                                  |
 | `CLAUDE_DIRECTSDK_DEBUG_DUMP_DIR`   | Write each forwarded request body (never headers) for cache analysis. Bodies contain the conversation. |

@@ -7,8 +7,8 @@
  * most one upstream request. Native authentication and identity headers pass
  * through memory; they are never logged or persisted.
  *
- * Only HTTP transfer encoding changes. Request identity and payload stay
- * native.
+ * Only HTTP transfer and content encoding change (large bodies go upstream
+ * gzipped, see request-gzip.ts). Request identity and payload stay native.
  */
 
 import { IncomingMessage, Server, ServerResponse, createServer } from "node:http";
@@ -17,6 +17,7 @@ import { request as httpsRequest, type RequestOptions } from "node:https";
 import { relocateHistoryBreakpoint, relocationEnabled } from "./cache-breakpoint.js";
 import { isTestUpstream } from "./request.js";
 import { describeProxy, openProxiedTls, resolveUpstreamProxy } from "./upstream-proxy.js";
+import { isGzipRejection, latchGzipOff, mayBeGzipRejection, planGzip } from "./request-gzip.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { Socket } from "node:net";
@@ -27,6 +28,7 @@ const ERROR_BODY_CAP = 64 * 1024;
 const REQUEST_BODY_CAP = 512 * 1024 * 1024;
 const PROXY_TUNNEL_ATTEMPTS = 4;
 const PROXY_RETRY_BASE_MS = 500;
+const ANTHROPIC_HOST = "api.anthropic.com";
 
 /** Relay failure marker for a request that carried non-subscription credentials. */
 export const AUTH_REFUSED = "NON_SUBSCRIPTION_AUTH_REFUSED";
@@ -230,6 +232,8 @@ export class AdmissionRelay {
   failure: string | null = null;
   capture = new SseCapture();
   errorBody = Buffer.alloc(0);
+  /** Wire form of the admitted upstream body, set once it is sent. */
+  gzip: RelayGzip | null = null;
   /** Fired when the admitted upstream response headers arrive. */
   onUpstreamResponse: ((status: number, headers: Record<string, string>) => void) | null = null;
 
@@ -426,6 +430,17 @@ export class AdmissionRelay {
 
     try {
       await this.forward(req, res, body);
+      if (dumpDir && this.gzip) {
+        try {
+          writeFileSync(
+            join(dumpDir, `wire-${Date.now()}-${process.pid}.json`),
+            JSON.stringify({ ...this.gzip, status: this.status }),
+            { mode: 0o600 },
+          );
+        } catch {
+          // Diagnostics must never affect the request.
+        }
+      }
     } catch (error) {
       // Keep a specific diagnosis (proxy tunnel failure) set by forward().
       this.failure ??= error instanceof Error ? error.name : String(error);
@@ -447,6 +462,35 @@ export class AdmissionRelay {
     res: ServerResponse,
     body: Buffer,
   ): Promise<void> {
+    // OMP port: gzip the public leg. The native child never compresses a body
+    // bound for the loopback relay. See request-gzip.ts.
+    const eligibleHost =
+      (this.target.scheme === "https:" && this.target.host === ANTHROPIC_HOST) ||
+      isTestUpstream(process.env);
+    const plan = planGzip(body, req.headers, eligibleHost, process.env);
+    this.gzip = plan.gzip
+      ? { encoding: "gzip", plainBytes: plan.plainBytes, wireBytes: plan.payload.length }
+      : { encoding: "identity", plainBytes: plan.plainBytes, wireBytes: plan.plainBytes, reason: plan.reason };
+    if (plan.gzip) {
+      const outcome = await this.send(req, res, plan.payload, true);
+      if (outcome === "done") return;
+      // The upstream could not decode the gzip body and ran nothing. Resend
+      // it plain once and keep this process on plain bodies.
+      latchGzipOff();
+      this.gzip = { ...this.gzip, encoding: "identity", wireBytes: body.length, fellBack: true };
+      this.status = null;
+      this.requestId = null;
+      this.errorBody = Buffer.alloc(0);
+    }
+    await this.send(req, res, body, false);
+  }
+
+  private async send(
+    req: IncomingMessage,
+    res: ServerResponse,
+    body: Buffer,
+    gzip: boolean,
+  ): Promise<"done" | "gzip_rejected"> {
     // OMP port: node:https ignores proxy variables, so tunnel explicitly when
     // the user's environment routes HTTPS through a proxy.
     const proxy =
@@ -473,7 +517,7 @@ export class AdmissionRelay {
       }
       this.track(tunnel);
     }
-    return new Promise((resolve, reject) => {
+    return new Promise<"done" | "gzip_rejected">((resolve, reject) => {
       const headers: Record<string, string | string[]> = {};
       for (const [key, value] of Object.entries(req.headers)) {
         if (value === undefined || HOP_BY_HOP.has(key.toLowerCase())) {
@@ -482,6 +526,9 @@ export class AdmissionRelay {
         headers[key] = value;
       }
       headers["accept-encoding"] = "identity";
+      if (gzip) {
+        headers["content-encoding"] = "gzip";
+      }
       const send =
         this.target.scheme === "https:" ? httpsRequest : httpRequest;
       const options: RequestOptions = {
@@ -516,14 +563,35 @@ export class AdmissionRelay {
             }
             passthrough[key] = value;
           }
-          try {
-            if (this.onUpstreamResponse) {
-              const flat: Record<string, string> = {};
-              for (const [key, value] of Object.entries(passthrough)) {
-                flat[key] = Array.isArray(value) ? value.join(", ") : value;
+          if (gzip && mayBeGzipRejection(this.status ?? 0)) {
+            // Hold a possible gzip refusal back from the child until the
+            // body shows whether a plain resend is due.
+            const chunks: Buffer[] = [];
+            upstreamRes.on("data", (chunk: Buffer) => {
+              chunks.push(chunk);
+            });
+            upstreamRes.on("end", () => {
+              const held = Buffer.concat(chunks);
+              const errorBody = held.subarray(0, ERROR_BODY_CAP);
+              if (isGzipRejection(this.status ?? 0, upstreamRes.headers, errorBody)) {
+                resolve("gzip_rejected");
+                return;
               }
-              this.onUpstreamResponse(this.status ?? 502, flat);
-            }
+              this.errorBody = errorBody;
+              try {
+                this.onUpstreamResponse?.(this.status ?? 502, flatten(passthrough));
+                res.writeHead(this.status ?? 502, passthrough);
+                res.end(held);
+              } catch {
+                // Child went away; errorBody still holds the diagnosis.
+              }
+              resolve("done");
+            });
+            upstreamRes.on("error", reject);
+            return;
+          }
+          try {
+            this.onUpstreamResponse?.(this.status ?? 502, flatten(passthrough));
             res.writeHead(this.status ?? 502, passthrough);
           } catch (error) {
             upstreamRes.destroy();
@@ -556,7 +624,7 @@ export class AdmissionRelay {
             } catch {
               // Child went away; capture still holds the diagnosis.
             }
-            resolve();
+            resolve("done");
           });
           upstreamRes.on("error", reject);
         },
@@ -577,6 +645,25 @@ export class AdmissionRelay {
       upstream.end(body);
     });
   }
+}
+
+/** Wire form of the upstream body; sizes are bytes. */
+export interface RelayGzip {
+  encoding: "gzip" | "identity";
+  plainBytes: number;
+  wireBytes: number;
+  /** Why the body went plain, when it did on the first attempt. */
+  reason?: string;
+  /** The upstream refused the gzip body and the relay resent it plain. */
+  fellBack?: boolean;
+}
+
+function flatten(headers: Record<string, string | string[]>): Record<string, string> {
+  const flat: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    flat[key] = Array.isArray(value) ? value.join(", ") : value;
+  }
+  return flat;
 }
 
 function readBody(req: IncomingMessage, cap: number): Promise<Buffer> {
