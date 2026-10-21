@@ -7,6 +7,21 @@ spawns one request-scoped `claude` process, and OMP executes every tool.
 
 ## Install
 
+From the marketplace catalog in this repository
+(`.omp-plugin/marketplace.json`):
+
+```sh
+omp plugin marketplace add Realtyxxx/omp-claude-directsdk
+omp plugin install claude-directsdk@omp-claude-directsdk
+```
+
+The plugin has no runtime dependencies to install: `@oh-my-pi/*` imports
+resolve to the host OMP, and the `devDependencies` copies exist only for
+`npm run check`. Add a local checkout as a marketplace only from a clean
+tree, because a local source is copied whole, `node_modules` included.
+
+For development, link a checkout instead:
+
 ```sh
 omp plugin link ~/workspace/omp-claude-directsdk
 omp models claude-directsdk     # first run fills OMP's model cache

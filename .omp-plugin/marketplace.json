@@ -1,0 +1,26 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "omp-claude-directsdk",
+  "owner": {
+    "name": "Realtyxxx"
+  },
+  "metadata": {
+    "description": "Claude as an OMP model provider through the unmodified Claude Code executable"
+  },
+  "plugins": [
+    {
+      "name": "claude-directsdk",
+      "description": "Claude model provider for OMP that runs the unmodified Claude Code CLI as its transport; OMP keeps the transcript and executes every tool",
+      "source": "./",
+      "version": "0.1.6",
+      "author": {
+        "name": "Joao Marcos"
+      },
+      "homepage": "https://github.com/Realtyxxx/omp-claude-directsdk",
+      "repository": "https://github.com/Realtyxxx/omp-claude-directsdk",
+      "license": "MIT",
+      "keywords": ["claude", "claude-code", "model-provider"],
+      "category": "development"
+    }
+  ]
+}

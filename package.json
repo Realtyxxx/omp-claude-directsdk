@@ -2,7 +2,7 @@
   "name": "pi-claude-directsdk",
   "version": "0.1.6",
   "type": "module",
-  "description": "Claude as a Pi model provider through the unmodified Claude Code executable. Pi owns the transcript and tools; the CLI supplies subscription authentication as a model transport.",
+  "description": "Claude as an OMP model provider through the unmodified Claude Code executable. OMP owns the transcript and tools; the CLI supplies subscription authentication as a model transport.",
   "license": "MIT",
   "author": "Joao Marcos",
   "repository": {
@@ -13,7 +13,15 @@
   "bugs": {
     "url": "https://github.com/joaomj/pi-claude-directsdk/issues"
   },
-  "keywords": ["pi-package", "pi", "extension", "claude", "claude-code", "model-provider"],
+  "keywords": [
+    "omp-plugin",
+    "omp",
+    "oh-my-pi",
+    "extension",
+    "claude",
+    "claude-code",
+    "model-provider"
+  ],
   "files": [
     "extensions/**/*",
     "src/**/*",
@@ -29,21 +37,20 @@
   "engines": {
     "node": ">=20"
   },
-  "pi": {
+  "omp": {
     "extensions": [
       "./extensions/claude-directsdk/index.ts"
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
-  },
-  "allowScripts": {
-    "@google/genai@2.21.0": true,
-    "protobufjs@7.6.6": true
+    "@oh-my-pi/pi-ai": "*",
+    "@oh-my-pi/pi-catalog": "*",
+    "@oh-my-pi/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.87.1",
+    "@oh-my-pi/pi-ai": "18.12.4",
+    "@oh-my-pi/pi-catalog": "18.12.4",
+    "@oh-my-pi/pi-coding-agent": "18.12.4",
     "typescript": "^5.9.3"
   },
   "scripts": {
