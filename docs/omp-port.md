@@ -71,8 +71,12 @@ The child runs with `--setting-sources ""`, `--strict-mcp-config`,
 OMP supplies the system prompt. So none of the user's Claude Code setup
 applies to it: `~/.claude/settings.json` (hooks, permissions, `env`, model,
 plugins, status line), CLAUDE.md and rules, MCP servers, skills and
-commands. It still reads its login and account record; the account email is
-injected into the current query as a `<system-reminder>`.
+commands. It still reads its login and account record and attaches an
+account context `<system-reminder>` (`userEmail`, ...) to the current query:
+a leading text block on a user turn, or text appended to the latest
+`tool_result` in a tool loop. The relay strips that block
+(`src/native-context.ts`) before forwarding, so the model never sees it as
+tool output.
 
 On the OMP side, everything that travels in the system prompt and tools
 applies. These request options do not: sampling parameters, `tool_choice`
@@ -83,7 +87,8 @@ the effort level is sent).
 ## Prompt caching
 
 The native child decorates each request in two ways that OMP never stores:
-it prepends its account context block to the message it is answering, and it
+it attaches its account context block to the message it is answering (the
+relay strips it), and it
 appends a date system message that carries its only message-level
 `cache_control`. The next request therefore diverges at the previous query,
 and no cache entry ever exists before it.
@@ -98,8 +103,9 @@ flowchart LR
 
 `src/cache-breakpoint.ts` moves that marker to the last block before the
 current query, and adds one at the previous request's same boundary when the
-four-breakpoint budget allows. Nothing else in the body changes; a body it
-cannot parse, a compressed body, or a thinking-block target passes unchanged.
+four-breakpoint budget allows. Apart from the account context strip, nothing
+else in the body changes; a body it cannot parse, a compressed body, or a
+thinking-block target passes unchanged.
 
 Measured on `claude-haiku-5-5` (one tool loop, then two resumed turns in new
 OMP processes):

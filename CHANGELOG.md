@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The relay strips the Claude CLI's account context `<system-reminder>` (`# userEmail`, `attachedProject`, or a "session context has changed" update) from user turns and `tool_result` content before forwarding (`src/native-context.ts`). The CLI appended it to the latest tool result on every tool-loop request, so the model kept reporting a foreign "userEmail" reminder inside tool output.
 - The relay gzips the upstream Messages body on the public leg (`src/request-gzip.ts`), after the cache-breakpoint edit, because Claude Code only compresses bodies it sends to `api.anthropic.com` itself and never one bound for the loopback relay. It follows the CLI's default path: zlib default level for bodies of at least 4096 bytes. If the API answers 400, 403 or 415 with an Anthropic request id (`req_…` or `cf-ray`) and a "body is not valid JSON" message, the relay resends the body plain once and keeps the rest of the process on plain bodies. `CLAUDE_DIRECTSDK_GZIP=0` disables it; `CLAUDE_DIRECTSDK_DEBUG_DUMP_DIR` also writes `wire-*.json` with the encoding and sizes.
 
 ### Changed

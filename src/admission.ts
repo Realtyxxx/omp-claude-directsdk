@@ -15,6 +15,7 @@ import { IncomingMessage, Server, ServerResponse, createServer } from "node:http
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest, type RequestOptions } from "node:https";
 import { relocateHistoryBreakpoint, relocationEnabled } from "./cache-breakpoint.js";
+import { stripNativeContext } from "./native-context.js";
 import { isTestUpstream } from "./request.js";
 import { describeProxy, openProxiedTls, resolveUpstreamProxy } from "./upstream-proxy.js";
 import { isGzipRejection, latchGzipOff, mayBeGzipRejection, planGzip } from "./request-gzip.js";
@@ -413,7 +414,9 @@ export class AdmissionRelay {
       res.end();
       return;
     }
-    // OMP port: the only edit to the native body. See cache-breakpoint.ts.
+    // OMP port: the only edits to the native body. See native-context.ts and
+    // cache-breakpoint.ts.
+    body = stripNativeContext(body, req.headers);
     if (relocationEnabled(process.env)) {
       body = relocateHistoryBreakpoint(body, req.headers);
     }
