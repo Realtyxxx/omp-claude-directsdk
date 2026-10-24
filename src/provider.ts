@@ -18,6 +18,8 @@ export { PROVIDER_ID };
 
 /** OMP aborts a dynamic model fetch after 15 s; finish (or fail) first. */
 const CATALOG_DEADLINE_MS = 12_000;
+/** Time kept back from the deadline for returning the catalog. */
+const CATALOG_MARGIN_MS = 500;
 
 /**
  * Placeholder credential. OMP refuses to dispatch a provider without a
@@ -34,6 +36,7 @@ export function createProviderConfig(report: (message: string) => void) {
     streamSimple,
     usage: claudeDirectSdkUsage,
     async fetchDynamicModels(): Promise<ChatModel[]> {
+      const started = Date.now();
       const signal = AbortSignal.timeout(CATALOG_DEADLINE_MS);
       try {
         const [{ discoverModels }, { loadWebCatalog }] = await Promise.all([
@@ -45,7 +48,9 @@ export function createProviderConfig(report: (message: string) => void) {
           report(`Claude DirectSDK excluded models with incomplete metadata:\n${result.warnings.join("\n")}`);
         }
         if (!result.models.length) throw new Error("No Claude models have complete, verified metadata");
-        return result.models;
+        const remaining = CATALOG_DEADLINE_MS - CATALOG_MARGIN_MS - (Date.now() - started);
+        const legacy = await legacyModels(result.legacy, remaining, report);
+        return [...result.models, ...legacy].sort((a, b) => a.id.localeCompare(b.id));
       } catch (error) {
         const message = `Claude DirectSDK catalog refresh failed: ${error instanceof Error ? error.message : error}. No pinned fallback is used.`;
         report(message);
@@ -53,6 +58,38 @@ export function createProviderConfig(report: (message: string) => void) {
       }
     },
   };
+}
+
+/**
+ * Legacy models that pass the subscription access probe. Probes keep running
+ * past the catalog deadline and cache their verdict, so a model whose probe
+ * is still out appears on the next refresh. `CLAUDE_DIRECTSDK_LEGACY_MODELS=0`
+ * lists none and sends no probe.
+ */
+async function legacyModels(
+  candidates: ChatModel[], remainingMs: number, report: (message: string) => void,
+): Promise<ChatModel[]> {
+  if (!candidates.length || process.env["CLAUDE_DIRECTSDK_LEGACY_MODELS"] === "0") return [];
+  const { probeAccount, probeLegacyModel } = await import("./model-probe.js");
+  const account = probeAccount();
+  const pending = new Set(candidates.map(model => model.id));
+  const models: ChatModel[] = [];
+  const notes: string[] = [];
+  const probes = Promise.all(candidates.map(async candidate => {
+    const outcome = await probeLegacyModel(candidate, await account);
+    pending.delete(candidate.id);
+    if (outcome.model) models.push(outcome.model);
+    if (outcome.note) notes.push(outcome.note);
+  }));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    probes,
+    new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(0, remainingMs)); }),
+  ]);
+  clearTimeout(timer);
+  for (const id of pending) notes.push(`${id}: access probe still running; listed on the next refresh if it passes`);
+  if (notes.length) report(`Claude DirectSDK legacy models:\n${notes.sort().join("\n")}`);
+  return [...models];
 }
 
 export function streamSimple(

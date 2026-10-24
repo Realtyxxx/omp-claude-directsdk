@@ -81,6 +81,24 @@ Public Anthropic Markdown documents supply current model IDs, model pages, price
 
 Missing metadata excludes only the affected model with a warning. Shared-source failures reject refresh and remove the snapshot. Refresh uses a shared deadline and abort signal. Pi owns persistence and generation-checked publication.
 
+### Legacy models (`src/model-probe.ts`)
+
+The overview's "Legacy models (still available)" list names older models the API still serves. Their pages give the Claude API ID, and their metadata is verified like any current model. Neither the docs nor the CLI picker say whether a subscription login may use them, so each legacy model is listed only after one minimal request (about 300 input tokens) through the normal call path succeeds on the exact native route:
+
+```mermaid
+flowchart TD
+  A[Legacy candidate] --> B{Context >= 1M?}
+  B -- yes --> C["Probe id[1m]"]
+  B -- no --> D[Probe id]
+  C -- answered --> OK[List with verified metadata]
+  C -- "429: usage credits for long context" --> D
+  D -- answered by the same model --> OK2[List; 1M candidates drop to 200K]
+  D -- "404/403/400 model, or served by another model" --> X[Exclude with a warning]
+  C & D -- "timeout, 429, 5xx" --> I[Exclude this refresh; retry next refresh]
+```
+
+For a 1M candidate both routes are probed at once, so the fallback fits inside one refresh. A probe passes only when the requested model answered: a retired ID (for example `claude-opus-4-1-20250805`) can be served silently by a newer model. Verdicts are cached in `~/.cache/omp-claude-directsdk/model-probes.json` per login account (pass: 7 days; refusal: 3 days; inconclusive: not cached). The account key hashes the `claude auth status` config directory, auth method, email and organization, plus `CLAUDE_CODE_OAUTH_TOKEN` when set, so switching accounts never reuses another account's verdicts; when the status cannot be read the cache is bypassed. Probes check the CLI version with an asynchronous `claude --version` that shares the request path's cache, because the request path's synchronous check would block the deadline timer. Probes outlive the catalog deadline and still cache their verdict, so a model whose probe is still out appears on the next refresh. `CLAUDE_DIRECTSDK_LEGACY_MODELS=0` lists no legacy model and sends no probe.
+
 ### Request-time probes (`src/setup.ts`)
 
 CLI resolution and version qualification run only when a model call needs them. They are not part of catalog discovery or editor startup.
@@ -97,6 +115,7 @@ CLI resolution and version qualification run only when a model call needs them. 
 The catalog has no hand-written model inventory, aliases, limits, or price table. Its sources are:
 
 - Claude Code’s account picker for resolved aliases and account-visible models.
+- One access probe per legacy model, cached (see Legacy models).
 - [Anthropic’s model overview](https://platform.claude.com/docs/en/about-claude/models/overview) and linked model pages for canonical routes and capabilities.
 - [Anthropic’s pricing documentation](https://platform.claude.com/docs/en/about-claude/pricing) for token prices, request-wide tiers, and cache lifetimes.
 - [Anthropic’s effort documentation](https://platform.claude.com/docs/en/build-with-claude/effort) for web-only model effort levels.

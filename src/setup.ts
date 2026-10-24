@@ -1,8 +1,9 @@
 /** CLI resolution and request-time authentication/version probes.
- * Catalog discovery lives in discovery.ts and never calls synchronous probes.
+ * Catalog discovery lives in discovery.ts and never calls synchronous probes;
+ * catalog-time callers use the async variants below.
  */
 
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { delimiter, join } from "node:path";
 import { LOGIN_HINT, INSTALL_HINT } from "./errors.js";
@@ -161,6 +162,7 @@ export function setupStatus(options?: {
  * The result is cached per resolved command for the process lifetime.
  */
 const qualifiedCache = new Map<string, boolean>();
+const qualifiedPending = new Map<string, Promise<boolean>>();
 
 export function qualifiedCli(resolved: string[], env: NodeJS.ProcessEnv): boolean {
   const key = resolved.join("\0");
@@ -184,4 +186,46 @@ export function qualifiedCli(resolved: string[], env: NodeJS.ProcessEnv): boolea
   }
   qualifiedCache.set(key, ok);
   return ok;
+}
+
+/** Run the CLI without blocking the event loop; resolves to stdout, or "" on failure. */
+export function runCli(
+  resolved: string[],
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): Promise<string> {
+  const [bin = "", ...rest] = resolved;
+  return new Promise((resolve) => {
+    const child = execFile(
+      bin,
+      [...rest, ...args],
+      { env: setupChildEnv(env), encoding: "utf-8", timeout: timeoutMs, maxBuffer: 1024 * 1024 },
+      (error, stdout) => resolve(error ? "" : stdout),
+    );
+    child.stdin?.end();
+  });
+}
+
+/**
+ * `qualifiedCli` for callers that must not block, such as catalog refresh.
+ * Shares the process-lifetime cache, so a later request skips its own probe.
+ */
+export function qualifiedCliAsync(resolved: string[], env: NodeJS.ProcessEnv): Promise<boolean> {
+  const key = resolved.join("\0");
+  const cached = qualifiedCache.get(key);
+  if (cached !== undefined) {
+    return Promise.resolve(cached);
+  }
+  let pending = qualifiedPending.get(key);
+  if (!pending) {
+    pending = runCli(resolved, ["--version"], env, 15000).then((out) => {
+      const ok = cliVersionSupported(parseCliVersion(out));
+      qualifiedCache.set(key, ok);
+      qualifiedPending.delete(key);
+      return ok;
+    });
+    qualifiedPending.set(key, pending);
+  }
+  return pending;
 }

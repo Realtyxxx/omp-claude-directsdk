@@ -28,7 +28,12 @@ export interface ChatModel {
   maxTokens: number;
   cost: Rates;
 }
-export interface CatalogResult { models: ChatModel[]; warnings: string[] }
+/**
+ * `legacy` holds still-available legacy models that neither the current
+ * lineup nor the CLI picker lists. Their metadata is verified like any other
+ * row, but subscription access is not: the caller probes them before use.
+ */
+export interface CatalogResult { models: ChatModel[]; legacy: ChatModel[]; warnings: string[] }
 
 const OMP_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
@@ -172,12 +177,38 @@ export async function loadWebCatalog(picker: DiscoveredModel[], signal: AbortSig
   const effort = tables(efforts).find(table => table.some(row => row[0] === "max") && table.some(row => row[0] === "low"));
   if (!effort) throw new Error(`Missing effort table in ${EFFORT}`);
   const links = new Map<string, { name: string; url: string }>();
-  for (const match of overview.matchAll(/\[(Claude [^\]]+)\]\((https:\/\/platform\.claude\.com\/docs\/en\/models\/([a-z0-9-]+)\/overview)\)/g)) {
+  const pattern = /\[(Claude [^\]]+)\]\((https:\/\/platform\.claude\.com\/docs\/en\/models\/([a-z0-9-]+)\/overview)\)/g;
+  for (const match of overview.matchAll(pattern)) {
     links.set(match[3]!, { name: match[1]!, url: `${match[2]}.md` });
   }
-  const ids = [...new Set([...current, ...picker.map(row => row.id)])];
-  const models: ChatModel[] = [];
+  // Each model page is read once, whether for a legacy ID or for its metadata.
+  const pages = new Map<string, Promise<string[][][]>>();
+  const page = (url: string): Promise<string[][][]> => {
+    let pending = pages.get(url);
+    if (!pending) {
+      pending = document(url, signal).then(tables);
+      pages.set(url, pending);
+    }
+    return pending;
+  };
   const warnings: string[] = [];
+  const legacyLine = /^Legacy models \(still available\):(.*)$/m.exec(overview)?.[1];
+  if (!legacyLine) warnings.push(`legacy models: missing "Legacy models (still available)" list in ${OVERVIEW}`);
+  const legacyIds = (await Promise.all([...(legacyLine ?? "").matchAll(pattern)].map(async match => {
+    try {
+      const id = (await page(`${match[2]}.md`)).flat().find(row => row[0] === "Claude API")?.[1];
+      if (!id || !/^claude-[a-z0-9-]+$/.test(id)) throw new Error("missing Claude API ID");
+      return id;
+    } catch (error) {
+      signal.throwIfAborted();
+      warnings.push(`${match[1]}: ${error instanceof Error ? error.message : error}`);
+      return undefined;
+    }
+  }))).filter((id): id is string => id !== undefined);
+  const listed = new Set([...current, ...picker.map(row => row.id)]);
+  const ids = [...new Set([...listed, ...legacyIds])];
+  const models: ChatModel[] = [];
+  const legacy: ChatModel[] = [];
   // Bound concurrent document requests independently of future catalog size.
   for (let start = 0; start < ids.length; start += 4) {
     await Promise.all(ids.slice(start, start + 4).map(async id => {
@@ -185,21 +216,24 @@ export async function loadWebCatalog(picker: DiscoveredModel[], signal: AbortSig
       try {
         const link = links.get(id.replace(/^claude-/, "").replace(/-\d{8}$/, ""));
         if (!link) throw new Error("missing official model page");
-        const page = tables(await document(link.url, signal));
-        if (!page.some(table => table.some(row => row[0] === "Claude API" && row[1] === id))) {
+        const info = await page(link.url);
+        if (!info.some(table => table.some(row => row[0] === "Claude API" && row[1] === id))) {
           throw new Error("official model page does not confirm this model ID");
         }
-        const features = page.find(table => table.some(row => row[0] === "Input → output"));
+        const features = info.find(table => table.some(row => row[0] === "Input → output"));
         const value = (key: string): string | undefined => features?.find(row => row[0] === key)?.[1];
         const thinking = value("Thinking");
-        if (!thinking || !/^(Adaptive(?: \(always on\))?|Extended|Not supported)$/i.test(thinking)) throw new Error("missing thinking capability");
+        if (!thinking || !/^(Adaptive(?: \((?:always on|extended deprecated)\))?|Extended|Not supported)$/i.test(thinking)) {
+          throw new Error("missing thinking capability");
+        }
         const inputs = value("Input → output");
         if (inputs !== "Text and images → text" && inputs !== "Text → text") throw new Error("missing input modalities");
         const live = picker.find(row => row.id === id);
         const levels = thinkingMap(link.name, thinking, value("Default effort"), live, effort);
         const thinkingConf = thinkingConfig(levels);
+        const isLegacy = !listed.has(id);
         const model: ChatModel = {
-          id, name: `${link.name} (subscription${live ? "" : "; not in CLI picker"})`,
+          id, name: `${link.name} (subscription${live ? "" : isLegacy ? "; legacy" : "; not in CLI picker"})`,
           api: PROVIDER_ID,
           reasoning: thinking !== "Not supported",
           ...(thinkingConf ? { thinking: thinkingConf } : {}),
@@ -208,6 +242,10 @@ export async function loadWebCatalog(picker: DiscoveredModel[], signal: AbortSig
           maxTokens: tokenLimit(value("Max output"), "output limit"),
           cost: pricingFor(link.name, pricing),
         };
+        if (isLegacy) {
+          legacy.push(model);
+          return;
+        }
         models.push(model);
         for (const alias of picker.filter(row => row.id === id && row.alias !== id)) {
           models.push({ ...model, id: alias.alias, name: `${link.name} (${alias.alias} alias)${/usage credit/i.test(alias.description) ? " · usage credits" : ""}` });
@@ -219,5 +257,9 @@ export async function loadWebCatalog(picker: DiscoveredModel[], signal: AbortSig
     }));
   }
   const unique = new Map(models.map(model => [model.id, model]));
-  return { models: [...unique.values()].sort((a, b) => a.id.localeCompare(b.id)), warnings: warnings.sort() };
+  return {
+    models: [...unique.values()].sort((a, b) => a.id.localeCompare(b.id)),
+    legacy: legacy.sort((a, b) => a.id.localeCompare(b.id)),
+    warnings: warnings.sort(),
+  };
 }

@@ -152,13 +152,15 @@ matched an uncompressed run.
 
 ## Settings added by the port
 
-| Variable                            | Purpose                                                                                                |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `CLAUDE_DIRECTSDK_CACHE_RELOCATE=0` | Keep the native breakpoint placement.                                                                  |
-| `CLAUDE_DIRECTSDK_GZIP=0`           | Send the upstream body uncompressed (see below).                                                       |
-| `CLAUDE_DIRECTSDK_CWD`              | Override the fixed child working directory.                                                            |
-| `CLAUDE_DIRECTSDK_MCP_RUNTIME`      | Interpreter for the inert MCP script.                                                                  |
-| `CLAUDE_DIRECTSDK_DEBUG_DUMP_DIR`   | Write each forwarded request body (never headers) for cache analysis. Bodies contain the conversation. |
+| Variable                            | Purpose                                                                                                                                                                                                                          |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CLAUDE_DIRECTSDK_CACHE_RELOCATE=0` | Keep the native breakpoint placement.                                                                                                                                                                                            |
+| `CLAUDE_DIRECTSDK_GZIP=0`           | Send the upstream body uncompressed (see below).                                                                                                                                                                                 |
+| `CLAUDE_DIRECTSDK_LEGACY_MODELS=0`  | List no legacy model and send no access probe.                                                                                                                                                                                   |
+| `CLAUDE_DIRECTSDK_PROBE_CACHE`      | Path of the legacy-model probe cache. Default `~/.cache/omp-claude-directsdk/model-probes.json`.                                                                                                                                 |
+| `CLAUDE_DIRECTSDK_CWD`              | Override the fixed child working directory.                                                                                                                                                                                      |
+| `CLAUDE_DIRECTSDK_MCP_RUNTIME`      | Interpreter for the inert MCP script.                                                                                                                                                                                            |
+| `CLAUDE_DIRECTSDK_DEBUG_DUMP_DIR`   | Write each forwarded request body (never headers) for cache analysis, and a `response-*.json` summary (status, request id, stop details, serving model, fallback hops, usage; no content text). Bodies contain the conversation. |
 
 ## Offline verification
 

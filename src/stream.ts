@@ -171,7 +171,10 @@ function mapStopReason(stop: string, detail?: string): {
         errorMessage: detail || "The model refused to complete the request",
       };
     default:
-      return { stopReason: "error", errorMessage: `Unhandled stop reason: ${stop}` };
+      return {
+        stopReason: "error",
+        errorMessage: `Unhandled stop reason: ${stop}${detail ? ` (${detail})` : ""}`,
+      };
   }
 }
 
@@ -487,6 +490,10 @@ async function executeCall(
                 redacted: true,
               });
               stream.push({ type: "thinking_start", contentIndex, partial: output });
+            } else if (block["type"] === "fallback") {
+              // Server-side fallback switch point (an audit marker). The
+              // authoritative message keeps it for the refusal diagnosis.
+              break;
             } else if (block["type"] === "tool_use") {
               pendingTools.push({
                 index,
@@ -600,10 +607,11 @@ async function executeCall(
     let authoritative: NativeAssistantMessage;
     const soleResult = results[0];
     // Native result diagnostics can be present even when stderr is empty.
+    const requestTag = relay.requestId ? `, request-id ${relay.requestId}` : "";
     const childDetail = child
       ? ` (exit ${child.exitInfo?.code ?? "?"}${
           child.exitInfo?.signal ? `/${child.exitInfo.signal}` : ""
-        }, stderr: ${child.stderrTail(500) || "<empty>"})`
+        }, stderr: ${child.stderrTail(500) || "<empty>"}${requestTag})`
       : "";
     if (results.length !== 1 || !soleResult) {
       throw incompleteError(
@@ -627,6 +635,7 @@ async function executeCall(
             `capture ${relay.capture.complete ? "complete" : "incomplete"}` +
             (relay.failure ? `, relay failure ${relay.failure}` : "") +
             `, native retries denied: ${relay.denied}` +
+            requestTag +
             (relay.errorText() ? `, upstream said: ${relay.errorText().slice(0, 500)}` : "") +
             (nativeErrorText ? `: ${nativeErrorText}` : ""),
         );
@@ -678,7 +687,7 @@ async function executeCall(
       (exitCode !== 0 || result?.is_error || result?.subtype !== "success")
     ) {
       const detail = resultErrors ? `: ${resultErrors}` : "";
-      throw nativeError(`${result?.subtype ?? "unknown exit"}${detail}`);
+      throw nativeError(`${result?.subtype ?? "unknown exit"}${detail}${childDetail}`);
     }
 
     const usage = mapUsage(authoritative.usage ?? streamUsage);
@@ -800,7 +809,9 @@ async function executeCall(
     const stop = authoritative.stop_reason ?? streamStop ?? (calls.length > 0 ? "tool_use" : "end_turn");
     const mapped = mapStopReason(
       stop,
-      stop === "refusal" ? refusalText(authoritative) : undefined,
+      stop === "refusal"
+        ? refusalDiagnosis(authoritative, nativeModelId, relay.requestId, relay.denied)
+        : undefined,
     );
     if (mapped.stopReason === "toolUse" && toolCalls.length === 0) {
       throw incompleteError("Native stopped for tool use without tool calls");
@@ -808,6 +819,12 @@ async function executeCall(
     output.stopReason = mapped.stopReason;
     if (mapped.errorMessage) {
       output.errorMessage = mapped.errorMessage;
+    }
+    if (mapped.stopReason === "error") {
+      const details = authoritative["stop_details"];
+      output.stopDetails = isRecord(details)
+        ? (deepClone(details) as NonNullable<AssistantMessage["stopDetails"]>)
+        : { type: stop };
     }
     calculateCost(model, output.usage);
 
@@ -919,11 +936,13 @@ function mergeAssistants(
 ): NativeAssistantMessage {
   const content: NativeContentBlock[] = [];
   let stop: string | null | undefined;
+  let stopDetails: unknown;
   let id: string | undefined;
   let model: string | undefined;
   for (const assistant of assistants) {
     content.push(...deepClone(assistant.content));
     stop = assistant.stop_reason ?? stop;
+    stopDetails = assistant["stop_details"] ?? stopDetails;
     id = assistant.id ?? id;
     model = assistant.model ?? model;
   }
@@ -931,6 +950,7 @@ function mergeAssistants(
     role: "assistant",
     content,
     stop_reason: stop ?? null,
+    ...(stopDetails ? { stop_details: deepClone(stopDetails) } : {}),
     usage: deepClone(result.usage ?? { input_tokens: 0, output_tokens: 0 }),
     ...(id ? { id } : {}),
     ...(model ? { model } : {}),
@@ -947,9 +967,77 @@ function textOf(message: NativeAssistantMessage): string {
     .join("");
 }
 
-function refusalText(message: NativeAssistantMessage): string {
-  const text = textOf(message);
-  return text || "The model refused to complete the request";
+const REFUSAL_TEXT_LIMIT = 500;
+
+/**
+ * Refusal diagnosis in the shape of OMP's own Anthropic provider
+ * ("Refusal (category): explanation"), plus what the bare stop reason hides:
+ * the serving model, server-side fallback hops, the recommended retry model,
+ * whether the decline came before any output, blocked native retries, the
+ * request id, and the model's own text when it wrote any.
+ */
+export function refusalDiagnosis(
+  message: NativeAssistantMessage,
+  requestedModel: string,
+  requestId: string | null,
+  deniedRetries: number,
+): string {
+  const details = isRecord(message["stop_details"]) ? message["stop_details"] : undefined;
+  const category = typeof details?.["category"] === "string" ? details["category"] : undefined;
+  const explanation =
+    typeof details?.["explanation"] === "string" ? details["explanation"].trim() : "";
+  const label = category
+    ? `Refusal (${category})`
+    : details
+      ? "Refusal (no category)"
+      : "Refusal (no stop_details)";
+
+  const facts: string[] = [];
+  const served = typeof message.model === "string" ? message.model : undefined;
+  facts.push(
+    served && served !== requestedModel
+      ? `served by ${served}, requested ${requestedModel}`
+      : `model ${served ?? requestedModel}`,
+  );
+  const hops = message.content
+    .map((block) => block as unknown as Record<string, unknown>)
+    .filter((block) => block["type"] === "fallback")
+    .map((block) => {
+      const from = isRecord(block["from"]) ? block["from"]["model"] : undefined;
+      const to = isRecord(block["to"]) ? block["to"]["model"] : undefined;
+      return `${String(from ?? "?")} -> ${String(to ?? "?")}`;
+    });
+  if (hops.length > 0) {
+    facts.push(`server fallback ${hops.join(", ")}`);
+  }
+  const iterations = isRecord(message.usage) ? message.usage["iterations"] : undefined;
+  if (Array.isArray(iterations) && iterations.length > 1) {
+    const attempts = iterations
+      .filter(isRecord)
+      .map((entry) => `${String(entry["type"] ?? "?")}(${String(entry["model"] ?? "?")})`);
+    facts.push(`attempts ${attempts.join(" -> ")}`);
+  }
+  const recommended = details?.["recommended_model"];
+  if (typeof recommended === "string" && recommended) {
+    facts.push(`recommended retry model ${recommended}`);
+  }
+  const text = textOf(message).trim();
+  const produced = text.length > 0 || message.content.some((block) => block.type === "tool_use");
+  facts.push(produced ? "declined mid-stream" : "declined before any output");
+  if (deniedRetries > 0) {
+    facts.push(`native retries denied: ${deniedRetries}`);
+  }
+  if (requestId) {
+    facts.push(`request-id ${requestId}`);
+  }
+
+  const head = explanation ? `${label}: ${explanation}` : label;
+  const quoted = text
+    ? ` Model text: ${JSON.stringify(
+        text.length > REFUSAL_TEXT_LIMIT ? `${text.slice(0, REFUSAL_TEXT_LIMIT)}...` : text,
+      )}`
+    : "";
+  return `${head} [${facts.join("; ")}]${quoted}`;
 }
 
 const INVENTORY_LIMIT = 40;
