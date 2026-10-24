@@ -13,10 +13,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Refusals report `stop_details` instead of the fixed "The model refused to complete the request": the category and explanation (`Refusal (cyber): …`, as in OMP's Anthropic provider), the serving model when a server-side fallback produced the turn, the `fallback` hops, `usage.iterations`, `recommended_model`, whether the decline came before any output, blocked native retries, the upstream request id, and the model's own text when it wrote any (`refusalDiagnosis` in `src/stream.ts`). The assistant message also carries `stopDetails`.
+- Relay failures keep the error message (`Error: Upstream request timed out`), not only its name (`relay failure Error`). `upstream` and `native` errors include the upstream request id when one was received.
+- `CLAUDE_DIRECTSDK_DEBUG_DUMP_DIR` also writes a `response-*.json` summary per request, without content text.
 - When the native child returns a tool call outside the advertised inventory, the `native` error now quotes the raw returned name (JSON-quoted) and lists the advertised native names (capped at 40, then `… N more`), via `describeInventory` in `src/stream.ts`. The leading text "Native returned a tool outside the current host inventory" is unchanged.
 
 ### Fixed
 
+- A `fallback` content block on the native stdout stream (a server-side fallback switch point, sent by Claude Code 2.1.302, which opts into server-side fallback) no longer fails the turn with "Unsupported native content block: fallback".
 - A native tool call whose name exactly matches an advertised wire name without the `mcp__pi__` prefix (for example `read`) is now accepted as that tool. Matching is exact and case-sensitive; other unprefixed names (for example `Bash`, `Read`) still fail with the `native` error.
 - Tool names stored in the replay carrier are normalized to the prefixed `mcp__pi__<wire>` form, so an accepted unprefixed call is never replayed unprefixed.
 
