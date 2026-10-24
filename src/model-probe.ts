@@ -11,11 +11,13 @@
  * A probe passes only when the requested model itself answered: retired IDs
  * can be served silently by a newer model, which is not access to the old one.
  */
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Api, Context, Model } from "@oh-my-pi/pi-ai";
 import { PROVIDER_ID } from "./models.js";
+import { qualifiedCliAsync, resolveClaude, runCli } from "./setup.js";
 import type { ChatModel } from "./web-catalog.js";
 
 const OK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -40,9 +42,27 @@ export function probeCachePath(env: NodeJS.ProcessEnv = process.env): string {
   return env["CLAUDE_DIRECTSDK_PROBE_CACHE"] || join(homedir(), ".cache", "omp-claude-directsdk", "model-probes.json");
 }
 
-/** Cache key: probes are per login, and the login is per config directory. */
-function cacheKey(route: string, env: NodeJS.ProcessEnv): string {
-  return `${env["CLAUDE_DIRECTSDK_CONFIG_DIR"] || env["CLAUDE_CONFIG_DIR"] || "default"}::${route}`;
+const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
+
+/**
+ * Opaque identity of the login a probe runs as, or undefined when it cannot
+ * be read. Access differs per account, so the cache is partitioned by it:
+ * `auth status` names the account and config directory, and an OAuth token
+ * from the environment is folded in by hash because it may override both.
+ */
+export async function probeAccount(env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  const resolved = resolveClaude(undefined, env);
+  if (!resolved) return undefined;
+  let status: Record<string, unknown>;
+  try {
+    status = JSON.parse(await runCli(resolved, ["auth", "status"], env, 5_000)) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+  if (status["loggedIn"] !== true) return undefined;
+  const token = env["CLAUDE_CODE_OAUTH_TOKEN"];
+  const parts = [status["configDirectory"], status["authMethod"], status["email"], status["orgId"], token ? sha256(token) : ""];
+  return sha256(JSON.stringify(parts)).slice(0, 32);
 }
 
 function readCache(path: string): Record<string, CacheEntry> {
@@ -58,7 +78,7 @@ function writeCacheEntry(path: string, key: string, outcome: ProbeOutcome): void
   if (outcome.status === "inconclusive") return;
   try {
     // Re-read so concurrent probes do not drop each other's entries.
-    const cache = readCache(path);
+    const cache = Object.fromEntries(Object.entries(readCache(path)).filter(([, entry]) => fresh(entry)));
     cache[key] = { ...outcome, checkedAt: Date.now() };
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const temp = `${path}.${process.pid}.tmp`;
@@ -102,7 +122,11 @@ export function classifyProbe(
 
 /** Default probe: one real request through the provider's own call path. */
 export const probeRoute: RouteProbe = async (route, timeoutMs) => {
-  const { streamClaudeDirectSdk } = await import("./stream.js");
+  const { defaultDeps, streamClaudeDirectSdk } = await import("./stream.js");
+  // The request path checks the CLI version synchronously; doing that here
+  // would stall the event loop and with it the catalog deadline.
+  const resolved = resolveClaude(undefined, process.env);
+  const qualified = resolved ? await qualifiedCliAsync(resolved, process.env) : false;
   const model = {
     id: route, name: route, api: PROVIDER_ID, provider: PROVIDER_ID, baseUrl: "process://claude-directsdk",
     reasoning: false, input: ["text"], contextWindow: 0, maxTokens: 64,
@@ -116,7 +140,7 @@ export const probeRoute: RouteProbe = async (route, timeoutMs) => {
   const message = await streamClaudeDirectSdk(model, context, {
     maxTokens: 64,
     signal: AbortSignal.timeout(timeoutMs),
-  }).result();
+  }, { ...defaultDeps, checkCli: () => qualified }).result();
   return classifyProbe(route, message);
 };
 
@@ -129,17 +153,19 @@ export interface ProbedModel {
 /**
  * Probe one legacy model on the route it would use. A 1M route refused for
  * lack of long-context credits falls back to the standard 200K route.
+ * `account` comes from `probeAccount`; without one the cache is bypassed.
  */
 export async function probeLegacyModel(
   model: ChatModel,
+  account: string | undefined,
   probe: RouteProbe = probeRoute,
   timeoutMs = 25_000,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<ProbedModel> {
   const path = probeCachePath(env);
   const check = async (route: string): Promise<ProbeOutcome> => {
-    const key = cacheKey(route, env);
-    const cached = readCache(path)[key];
+    const key = account ? `${account}::${route}` : undefined;
+    const cached = key ? readCache(path)[key] : undefined;
     if (fresh(cached)) return cached;
     let outcome: ProbeOutcome;
     try {
@@ -147,7 +173,7 @@ export async function probeLegacyModel(
     } catch (error) {
       outcome = { status: "inconclusive", detail: error instanceof Error ? error.message : String(error) };
     }
-    writeCacheEntry(path, key, outcome);
+    if (key) writeCacheEntry(path, key, outcome);
     return outcome;
   };
   const long = model.contextWindow >= 1_000_000;

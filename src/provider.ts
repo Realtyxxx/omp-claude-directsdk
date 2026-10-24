@@ -70,12 +70,13 @@ async function legacyModels(
   candidates: ChatModel[], remainingMs: number, report: (message: string) => void,
 ): Promise<ChatModel[]> {
   if (!candidates.length || process.env["CLAUDE_DIRECTSDK_LEGACY_MODELS"] === "0") return [];
-  const { probeLegacyModel } = await import("./model-probe.js");
+  const { probeAccount, probeLegacyModel } = await import("./model-probe.js");
+  const account = probeAccount();
   const pending = new Set(candidates.map(model => model.id));
   const models: ChatModel[] = [];
   const notes: string[] = [];
   const probes = Promise.all(candidates.map(async candidate => {
-    const outcome = await probeLegacyModel(candidate);
+    const outcome = await probeLegacyModel(candidate, await account);
     pending.delete(candidate.id);
     if (outcome.model) models.push(outcome.model);
     if (outcome.note) notes.push(outcome.note);
