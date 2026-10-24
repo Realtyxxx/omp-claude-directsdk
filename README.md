@@ -93,11 +93,14 @@ The request transport still loads on the first Claude request. See [docs/startup
 
 ## Configuration
 
-| Setting | Purpose |
-|---|---|
-| `CLAUDE_DIRECTSDK_COMMAND` | Override the `claude` executable path. |
-| `CLAUDE_DIRECTSDK_CONFIG_DIR` | Point at a logged-in CLI config directory. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Supply a token from `claude setup-token` in the environment Pi runs in. |
+| Setting                            | Purpose                                                                 |
+| ---------------------------------- | ----------------------------------------------------------------------- |
+| `CLAUDE_DIRECTSDK_COMMAND`         | Override the `claude` executable path.                                  |
+| `CLAUDE_DIRECTSDK_CONFIG_DIR`      | Point at a logged-in CLI config directory.                              |
+| `CLAUDE_CODE_OAUTH_TOKEN`          | Supply a token from `claude setup-token` in the environment Pi runs in. |
+| `CLAUDE_DIRECTSDK_LEGACY_MODELS=0` | Do not list legacy models or send their access probes.                  |
+
+Refresh also lists the still-available legacy models (for example Claude Opus 4.6 or Claude Haiku 4.5), labeled `legacy`. Each is listed only after one minimal request on its route succeeds for your login. The result is cached for a week. See [docs/architecture.md](docs/architecture.md#legacy-models-srcmodel-probets).
 
 See [docs/troubleshooting.md](docs/troubleshooting.md) for login and environment errors.
 
@@ -119,12 +122,12 @@ Per-model cost metadata comes from [Anthropic’s pricing documentation](https:/
 
 ## Documentation
 
-| Document | Contents |
-|---|---|
-| [docs/architecture.md](docs/architecture.md) | Request lifecycle, model routing, tool transport, admission relay. |
-| [docs/startup.md](docs/startup.md) | Cache-only initialization and lazy loading. |
-| [docs/testing.md](docs/testing.md) | Installed-Pi harness, paid scenarios, and complete-session replay. |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Missing CLI, logged-out CLI, conflicting environment. |
+| Document                                           | Contents                                                           |
+| -------------------------------------------------- | ------------------------------------------------------------------ |
+| [docs/architecture.md](docs/architecture.md)       | Request lifecycle, model routing, tool transport, admission relay. |
+| [docs/startup.md](docs/startup.md)                 | Cache-only initialization and lazy loading.                        |
+| [docs/testing.md](docs/testing.md)                 | Installed-Pi harness, paid scenarios, and complete-session replay. |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Missing CLI, logged-out CLI, conflicting environment.              |
 
 ## Acknowledgments
 

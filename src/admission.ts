@@ -409,7 +409,7 @@ export class AdmissionRelay {
     try {
       body = await readBody(req, REQUEST_BODY_CAP);
     } catch (error) {
-      this.failure = error instanceof Error ? error.name : String(error);
+      this.failure = describeError(error);
       res.writeHead(400, { Connection: "close" });
       res.end();
       return;
@@ -446,7 +446,7 @@ export class AdmissionRelay {
       }
     } catch (error) {
       // Keep a specific diagnosis (proxy tunnel failure) set by forward().
-      this.failure ??= error instanceof Error ? error.name : String(error);
+      this.failure ??= describeError(error);
       if (!res.headersSent) {
         res.writeHead(502, { Connection: "close" });
       }
@@ -457,7 +457,46 @@ export class AdmissionRelay {
       }
     } finally {
       this.sockets.delete(req.socket);
+      if (dumpDir) {
+        try {
+          writeFileSync(
+            join(dumpDir, `response-${Date.now()}-${process.pid}.json`),
+            JSON.stringify(this.responseSummary(), null, 2),
+            { mode: 0o600 },
+          );
+        } catch {
+          // Diagnostics must never affect the request.
+        }
+      }
     }
+  }
+
+  /**
+   * Response metadata for diagnosis: status, request id, stop reason and
+   * details, serving model, fallback hops, and usage. No content text.
+   */
+  responseSummary(): Record<string, unknown> {
+    const message = this.capture.message;
+    const details = isRecord(message?.["stop_details"])
+      ? { ...message["stop_details"] }
+      : message?.["stop_details"];
+    if (isRecord(details) && details["fallback_credit_token"]) {
+      details["fallback_credit_token"] = "<redacted>";
+    }
+    return {
+      status: this.status,
+      requestId: this.requestId,
+      failure: this.failure,
+      deniedRetries: this.denied,
+      captureComplete: this.capture.complete,
+      model: message?.model ?? null,
+      stop_reason: message?.stop_reason ?? null,
+      stop_details: details ?? null,
+      fallbacks: (message?.content ?? []).filter((block) => (block.type as string) === "fallback"),
+      blockTypes: (message?.content ?? []).map((block) => block.type),
+      usage: message?.usage ?? null,
+      ...(this.status !== null && this.status !== 200 ? { error: this.errorText().slice(0, 2000) } : {}),
+    };
   }
 
   private async forward(
@@ -606,8 +645,7 @@ export class AdmissionRelay {
               try {
                 this.capture.feed(chunk);
               } catch (error) {
-                this.failure =
-                  error instanceof Error ? error.name : String(error);
+                this.failure = describeError(error);
               }
             } else if (this.errorBody.length < ERROR_BODY_CAP) {
               // Bounded: keeps the rejection reason, never the whole stream.
@@ -685,6 +723,11 @@ function readBody(req: IncomingMessage, cap: number): Promise<Buffer> {
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
+}
+
+/** Name and message: the name alone ("Error") says nothing about the cause. */
+function describeError(error: unknown): string {
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
 function safeEqualPath(a: string, b: string): boolean {
